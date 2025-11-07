@@ -8,3 +8,4 @@ python-dotenv==1.0.1
 websockets==13.1
 python-multipart==0.0.9
 passlib[bcrypt]==1.7.4
+firebase-admin==6.5.0
