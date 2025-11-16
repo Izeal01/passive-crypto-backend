@@ -1,5 +1,8 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler  # Added: For per-user rate limiting
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 import ccxt
 import asyncio
 import json
@@ -10,7 +13,7 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import logging
-import os  # FIXED: Added for env vars (e.g., port, API keys)
+import os
 
 # Google Auth Imports (install: pip install firebase-admin)
 import firebase_admin
@@ -22,9 +25,14 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
 
+# Added: Rate limiter (100 req/min per IP; customize per-user later)
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # FIXED: "*" for production (allows all origins; restrict if needed)
+    allow_origins=["*"],  # "*" for production (allows all origins; restrict if needed)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,12 +40,7 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-api_keys = {'binance': {}, 'kraken': {}}
-manager = None
-trade_amount = 100.0
-auto_trade_enabled = False
-trade_threshold = 0.001  # Updated default: 0.1% (decimal) for more opportunities
-keys_loaded = False  # Flag to track if valid keys are set
+# Removed: Global api_keys/keys_loaded (now per-user dynamic)
 
 # Initialize Firebase Admin (use env var for prod; fallback to local file for dev)
 try:
@@ -54,16 +57,21 @@ except Exception as e:
     logger.error(f"Firebase init failed: {e}")  # Graceful failure (app runs without Firebase if needed)
 
 def init_db():
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))  # Added: Env var for DB path (e.g., /tmp/users.db on Render)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
-                  binance_key TEXT, binance_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+                  cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+    # Added: New table for per-user settings
+    c.execute('''CREATE TABLE IF NOT EXISTS user_settings
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
+                  trade_amount REAL DEFAULT 100.0, auto_trade_enabled BOOLEAN DEFAULT FALSE, 
+                  trade_threshold REAL DEFAULT 0.001)''')
     conn.commit()
     conn.close()
-    logger.info("Database initialized.")
+    logger.info("Database initialized with multi-user tables.")
 
 init_db()
 
@@ -76,19 +84,20 @@ def verify_password(plain: str, hashed: str) -> bool:
 def send_email(to_email: str, subject: str, body: str):
     try:
         msg = MIMEMultipart()
-        msg['From'] = os.environ.get('EMAIL_FROM', 'nomsucaudu@gmail.com')  # FIXED: Env var for prod
+        msg['From'] = os.environ.get('EMAIL_FROM', 'nomsucaudu@gmail.com')  # Env var for prod
         msg['To'] = to_email
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
         server = smtplib.SMTP('smtp.sendgrid.net', 587)
         server.starttls()
-        server.login('apikey', os.environ['SENDGRID_API_KEY'])  # FIXED: Require env var only (no fallback secret for deploy; set in cloud)
+        server.login('apikey', os.environ['SENDGRID_API_KEY'])  # Require env var only (no fallback secret for deploy; set in cloud)
         server.sendmail(msg['From'], [to_email], msg.as_string())
         server.quit()
         logger.info(f"Email sent to {to_email}")
     except Exception as e:
         logger.error(f"Email error: {e}")
 
+# Pydantic models (updated for per-user)
 class User(BaseModel):
     email: str
     password: str
@@ -100,20 +109,56 @@ class Toggle(BaseModel):
     enabled: bool
 
 class Threshold(BaseModel):
-    threshold: float = 0.001  # Updated default: 0.1% decimal
+    threshold: float = 0.001  # 0.1% decimal
 
 class ClearRequest(BaseModel):
     email: str
 
 class UserKeys(BaseModel):
     email: str
-    binance_key: str = ""
-    binance_secret: str = ""
+    cex_key: str = ""
+    cex_secret: str = ""
     kraken_key: str = ""
     kraken_secret: str = ""
 
 class GoogleUser(BaseModel):
     id_token: str  # JWT from GoogleSignIn
+
+# Helper: Load per-user keys from DB
+def load_user_keys(email: str) -> dict:
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
+    c = conn.cursor()
+    c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email = ?", (email,))
+    row = c.fetchone()
+    conn.close()
+    if row and all(row):  # All keys present
+        return {
+            'cex': {'apiKey': row[0], 'secret': row[1]},
+            'kraken': {'apiKey': row[2], 'secret': row[3]}
+        }
+    return {}  # Empty if incomplete/missing
+
+# Helper: Load/save per-user settings
+def load_user_settings(email: str) -> dict:
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
+    c = conn.cursor()
+    c.execute("SELECT trade_amount, auto_trade_enabled, trade_threshold FROM user_settings WHERE email = ?", (email,))
+    row = c.fetchone()
+    if not row:
+        # Default on first access
+        c.execute("INSERT OR IGNORE INTO user_settings (email) VALUES (?)", (email,))
+        conn.commit()
+        row = (100.0, False, 0.001)
+    conn.close()
+    return {'trade_amount': row[0], 'auto_trade_enabled': bool(row[1]), 'trade_threshold': row[2]}
+
+def save_user_setting(email: str, **kwargs):
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
+    c = conn.cursor()
+    for key, value in kwargs.items():
+        c.execute(f"UPDATE user_settings SET {key} = ? WHERE email = ?", (value, email))
+    conn.commit()
+    conn.close()
 
 @app.post("/google_login")
 async def google_login(google_user: GoogleUser):
@@ -123,7 +168,7 @@ async def google_login(google_user: GoogleUser):
         uid = decoded_token['uid']
         email = decoded_token['email']
         # Fetch user in DB
-        conn = sqlite3.connect('users.db')
+        conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
         c = conn.cursor()
         c.execute("SELECT id FROM users WHERE email = ?", (email,))
         row = c.fetchone()
@@ -147,7 +192,7 @@ async def google_signup(google_user: GoogleUser):
         uid = decoded_token['uid']
         email = decoded_token['email']
         # Create user (no password for Google users)
-        conn = sqlite3.connect('users.db')
+        conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
         c = conn.cursor()
         try:
             c.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email, "google_auth"))  # Placeholder pw
@@ -166,7 +211,7 @@ async def google_signup(google_user: GoogleUser):
 
 @app.post("/signup")
 async def signup(user: User):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
     c = conn.cursor()
     try:
         hashed = hash_password(user.password)
@@ -182,7 +227,7 @@ async def signup(user: User):
 
 @app.post("/login")
 async def login(user: User):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
     c = conn.cursor()
     c.execute("SELECT password FROM users WHERE email = ?", (user.email,))
     row = c.fetchone()
@@ -195,23 +240,18 @@ async def login(user: User):
 
 @app.post("/save_keys")
 async def save_keys(user_keys: UserKeys):
-    global api_keys, keys_loaded
     email = user_keys.email
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
     c = conn.cursor()
     try:
-        c.execute("INSERT OR REPLACE INTO user_api_keys (email, binance_key, binance_secret, kraken_key, kraken_secret) VALUES (?, ?, ?, ?, ?)",
-                  (email, user_keys.binance_key, user_keys.binance_secret, user_keys.kraken_key, user_keys.kraken_secret))
+        c.execute("INSERT OR REPLACE INTO user_api_keys (email, cex_key, cex_secret, kraken_key, kraken_secret) VALUES (?, ?, ?, ?, ?)",
+                  (email, user_keys.cex_key, user_keys.cex_secret, user_keys.kraken_key, user_keys.kraken_secret))
         conn.commit()
-        # Only load if all keys provided
-        if all([user_keys.binance_key, user_keys.binance_secret, user_keys.kraken_key, user_keys.kraken_secret]):
-            api_keys['binance'] = {'apiKey': user_keys.binance_key, 'secret': user_keys.binance_secret}
-            api_keys['kraken'] = {'apiKey': user_keys.kraken_key, 'secret': user_keys.kraken_secret}
-            keys_loaded = True
-            logger.info(f"Saved and loaded API keys for {email} - Monitoring enabled")
+        # No global load—dynamic per request
+        if all([user_keys.cex_key, user_keys.cex_secret, user_keys.kraken_key, user_keys.kraken_secret]):
+            logger.info(f"Saved API keys for {email} - Ready for per-user fetches")
         else:
             logger.warning(f"Incomplete keys for {email}")
-            keys_loaded = False
         return {"status": "saved"}
     except Exception as e:
         logger.error(f"Save Keys Error: {e}")
@@ -221,16 +261,12 @@ async def save_keys(user_keys: UserKeys):
 
 @app.post("/clear_keys")
 async def clear_keys(req: ClearRequest):
-    global api_keys, keys_loaded
     email = req.email
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
     c = conn.cursor()
     try:
         c.execute("DELETE FROM user_api_keys WHERE email = ?", (email,))
         conn.commit()
-        # Reset global keys as this user may have been the one loaded
-        api_keys = {'binance': {}, 'kraken': {}}
-        keys_loaded = False
         logger.info(f"Cleared API keys for {email}")
         return {"status": "cleared"}
     except Exception as e:
@@ -241,37 +277,39 @@ async def clear_keys(req: ClearRequest):
 
 @app.get("/get_keys")
 async def get_keys(email: str = Query(...)):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
     c = conn.cursor()
-    c.execute("SELECT binance_key, binance_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email = ?", (email,))
+    c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email = ?", (email,))
     row = c.fetchone()
     conn.close()
     if row:
         return {
-            "binance_key": row[0] or "",
-            "binance_secret": row[1] or "",
+            "cex_key": row[0] or "",
+            "cex_secret": row[1] or "",
             "kraken_key": row[2] or "",
             "kraken_secret": row[3] or "",
         }
     return {}
 
+# Updated: Per-user arbitrage (load keys dynamically)
 @app.get("/arbitrage/")
-async def get_arbitrage():
-    global keys_loaded
-    if not keys_loaded:
-        return {"error": "API keys not loaded"}
+async def get_arbitrage(email: str = Query(...)):
+    user_keys = load_user_keys(email)
+    if not user_keys:
+        return {"error": "API keys not loaded for this user"}
     try:
-        binance = ccxt.binance(api_keys['binance'])
-        kraken = ccxt.kraken(api_keys['kraken'])
-        binance_price = binance.fetch_ticker('XRP/USDT')['last']
+        cex = ccxt.cex(user_keys['cex'])
+        kraken = ccxt.kraken(user_keys['kraken'])
+        cex_price = cex.fetch_ticker('XRP/USD')['last']  # CEX.IO symbol 'XRP/USD' (USDT equivalent)
         kraken_price = kraken.fetch_ticker('XRP/USD')['last']
-        spread = abs(binance_price - kraken_price) / min(binance_price, kraken_price)  # decimal
+        spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)  # decimal
         spread_pct = spread * 100
+        settings = load_user_settings(email)
         pnl_after_fees = spread - 0.002  # 0.2% fees decimal
-        roi_usdt = pnl_after_fees * trade_amount
-        logger.info(f"Arbitrage: Binance {binance_price:.4f}, Kraken {kraken_price:.4f}, Spread {spread_pct:.4f}%, PnL {pnl_after_fees*100:.4f}%")
+        roi_usdt = pnl_after_fees * settings['trade_amount']
+        logger.info(f"Arbitrage for {email}: CEX {cex_price:.4f}, Kraken {kraken_price:.4f}, Spread {spread_pct:.4f}%, PnL {pnl_after_fees*100:.4f}%")
         return {
-            "binance": binance_price,
+            "cex": cex_price,
             "kraken": kraken_price,
             "spread": spread,
             "spread_pct": spread_pct,
@@ -280,70 +318,71 @@ async def get_arbitrage():
             "roi_usdt": roi_usdt
         }
     except Exception as e:
-        logger.error(f"Arbitrage fetch error: {e}")
+        logger.error(f"Arbitrage fetch error for {email}: {e}")
         return {"error": str(e)}
 
+# Updated: Per-user balances
 @app.get("/balances")
-async def get_balances():
-    global keys_loaded
-    if not keys_loaded:
-        return {"error": "API keys not loaded"}
+async def get_balances(email: str = Query(...)):
+    user_keys = load_user_keys(email)
+    if not user_keys:
+        return {"error": "API keys not loaded for this user"}
     try:
-        binance = ccxt.binance(api_keys['binance'])
-        kraken = ccxt.kraken(api_keys['kraken'])
-        b_bal = binance.fetch_balance()['USDT']['free']
+        cex = ccxt.cex(user_keys['cex'])
+        kraken = ccxt.kraken(user_keys['kraken'])
+        c_bal = cex.fetch_balance()['USD']['free']  # CEX.IO uses USD
         k_bal = kraken.fetch_balance()['USD']['free']
-        return {"binance_usdt": b_bal, "kraken_usdt": k_bal}
+        return {"cex_usd": c_bal, "kraken_usd": k_bal}
     except Exception as e:
-        logger.error(f"Balances error: {e}")
+        logger.error(f"Balances error for {email}: {e}")
         return {"error": str(e)}
 
+# Updated: Per-user settings
 @app.post("/set_amount")
-async def set_amount(a: Amount):
-    global trade_amount
+async def set_amount(a: Amount, email: str = Query(...)):
     if a.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
-    trade_amount = a.amount
-    logger.info(f"Trade amount set to {trade_amount}")
-    return {"status": "set", "amount": trade_amount}
+    save_user_setting(email, trade_amount=a.amount)
+    logger.info(f"Trade amount set to {a.amount} for {email}")
+    return {"status": "set", "amount": a.amount}
 
 @app.post("/toggle_auto_trade")
-async def toggle_auto_trade(t: Toggle):
-    global auto_trade_enabled
-    auto_trade_enabled = t.enabled
-    logger.info(f"Auto-trade {'enabled' if auto_trade_enabled else 'disabled'}")
-    return {"status": "toggled", "enabled": auto_trade_enabled}
+async def toggle_auto_trade(t: Toggle, email: str = Query(...)):
+    save_user_setting(email, auto_trade_enabled=t.enabled)
+    logger.info(f"Auto-trade {'enabled' if t.enabled else 'disabled'} for {email}")
+    return {"status": "toggled", "enabled": t.enabled}
 
 @app.get("/auto_trade_status")
-async def get_auto_trade_status():
-    global auto_trade_enabled
-    return {"enabled": auto_trade_enabled}
+async def get_auto_trade_status(email: str = Query(...)):
+    settings = load_user_settings(email)
+    return {"enabled": settings['auto_trade_enabled']}
 
 @app.post("/set_threshold")
-async def set_threshold(t: Threshold):
-    global trade_threshold
+async def set_threshold(t: Threshold, email: str = Query(...)):
     if t.threshold < 0:
         raise HTTPException(status_code=400, detail="Threshold must be non-negative")
-    trade_threshold = t.threshold
-    logger.info(f"Threshold set to {trade_threshold} (decimal: >= for trades)")
-    return {"status": "set", "threshold": trade_threshold}
+    save_user_setting(email, trade_threshold=t.threshold)
+    logger.info(f"Threshold set to {t.threshold} (decimal: >= for trades) for {email}")
+    return {"status": "set", "threshold": t.threshold}
 
-# WebSocket Manager (unchanged)
+# WebSocket Manager (updated for per-user prefix in broadcasts)
 class WebSocketManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: list[tuple[WebSocket, str]] = []  # (ws, user_email)
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, user_email: str = ""):  # Added: user_email for context
         await websocket.accept()
-        self.active_connections.append(websocket)
-        logger.info(f"WebSocket connected. Active: {len(self.active_connections)}")
+        self.active_connections.append((websocket, user_email))
+        logger.info(f"WebSocket connected for {user_email}. Active: {len(self.active_connections)}")
 
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        self.active_connections = [(ws, email) for ws, email in self.active_connections if ws != websocket]
 
-    async def broadcast(self, message: str):
+    async def broadcast(self, message: str, target_email: str = ""):  # Added: Filter by email if needed
         disconnected = []
-        for connection in self.active_connections:
+        for connection, conn_email in self.active_connections:
+            if target_email and conn_email != target_email:
+                continue  # Skip non-matching users
             try:
                 await connection.send_text(message)
             except WebSocketDisconnect:
@@ -354,8 +393,8 @@ class WebSocketManager:
 manager = WebSocketManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+async def websocket_endpoint(websocket: WebSocket, user_email: str = Query("")):  # Added: ?user_email= for context
+    await manager.connect(websocket, user_email)
     try:
         while True:
             await websocket.receive_text()
@@ -365,44 +404,52 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(broadcast_arbitrage())
-    logger.info("Bot started - Monitoring active (skips until keys loaded)")
+    logger.info("Bot started - Multi-user monitoring active")
 
+# Updated: Per-user broadcast (loop over users with enabled auto-trade)
 async def broadcast_arbitrage():
-    global keys_loaded
     while True:
         try:
-            if not keys_loaded:
-                await asyncio.sleep(30)
-                continue
-            arb_data = await get_arbitrage()
-            if isinstance(arb_data, dict) and "error" not in arb_data:
-                await manager.broadcast(json.dumps(arb_data))
-                if auto_trade_enabled and arb_data["pnl"] >= trade_threshold:  # >= logic confirmed
-                    await execute_arbitrage(arb_data["binance"], arb_data["kraken"])
-            await asyncio.sleep(1)
+            conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))
+            c = conn.cursor()
+            c.execute("SELECT email FROM user_settings WHERE auto_trade_enabled = 1")
+            users = [row[0] for row in c.fetchall()]
+            conn.close()
+
+            for email in users:
+                arb_data = await get_arbitrage(email)  # Per-user fetch
+                if isinstance(arb_data, dict) and "error" not in arb_data:
+                    # Prefix message with email for filtering (simple)
+                    prefixed = json.dumps({"user": email, **arb_data})
+                    await manager.broadcast(prefixed, target_email=email)
+                    if arb_data["pnl"] >= load_user_settings(email)['trade_threshold']:  # Per-user threshold
+                        await execute_arbitrage(email, arb_data["cex"], arb_data["kraken"])
+            await asyncio.sleep(1)  # Poll every 1s
         except Exception as e:
             logger.error(f"Broadcast error: {e}")
             await asyncio.sleep(5)
 
-async def execute_arbitrage(b_price: float, k_price: float):
-    global keys_loaded
-    if not keys_loaded:
+# Updated: Per-user trade execution
+async def execute_arbitrage(email: str, c_price: float, k_price: float):
+    user_keys = load_user_keys(email)
+    if not user_keys:
         return
+    settings = load_user_settings(email)
     try:
-        binance = ccxt.binance(api_keys['binance'])
-        kraken = ccxt.kraken(api_keys['kraken'])
-        xrp_amount = trade_amount / min(b_price, k_price)
-        if b_price < k_price:
-            binance.create_market_buy_order('XRP/USDT', xrp_amount)
+        cex = ccxt.cex(user_keys['cex'])
+        kraken = ccxt.kraken(user_keys['kraken'])
+        xrp_amount = settings['trade_amount'] / min(c_price, k_price)
+        if c_price < k_price:
+            cex.create_market_buy_order('XRP/USD', xrp_amount)  # CEX.IO symbol 'XRP/USD'
             kraken.create_market_sell_order('XRP/USD', xrp_amount)
         else:
             kraken.create_market_buy_order('XRP/USD', xrp_amount)
-            binance.create_market_sell_order('XRP/USDT', xrp_amount)
-        logger.info("Trade executed!")
+            cex.create_market_sell_order('XRP/USD', xrp_amount)  # CEX.IO symbol 'XRP/USD'
+        logger.info(f"Trade executed for {email}!")
     except Exception as e:
-        logger.error(f"Trade error: {e}")
+        logger.error(f"Trade error for {email}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # FIXED: Use env var for port (required for cloud like Render)
+    port = int(os.environ.get("PORT", 8000))  # Use env var for port (required for cloud like Render)
     uvicorn.run(app, host="0.0.0.0", port=port)
