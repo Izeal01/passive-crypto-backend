@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler  # Added: For per-user rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler  # For per-user rate limiting
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import ccxt
@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
 
-# Added: Rate limiter (100 req/min per IP; customize per-user later)
+# Rate limiter (100 req/min per IP; customize per-user later)
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -39,8 +39,6 @@ app.add_middleware(
 )
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# Removed: Global api_keys/keys_loaded (now per-user dynamic)
 
 # Initialize Firebase Admin (use env var for prod; fallback to local file for dev)
 try:
@@ -57,18 +55,38 @@ except Exception as e:
     logger.error(f"Firebase init failed: {e}")  # Graceful failure (app runs without Firebase if needed)
 
 def init_db():
-    conn = sqlite3.connect(os.environ.get('DB_PATH', 'users.db'))  # Added: Env var for DB path (e.g., /tmp/users.db on Render)
+    db_path = os.environ.get('DB_PATH', 'users.db')  # Env var for DB path (e.g., /tmp/users.db on Render)
+    conn = sqlite3.connect(db_path)
     c = conn.cursor()
+    
+    # Create tables if not exist
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
                   cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
-    # Added: New table for per-user settings
     c.execute('''CREATE TABLE IF NOT EXISTS user_settings
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
                   trade_amount REAL DEFAULT 100.0, auto_trade_enabled BOOLEAN DEFAULT FALSE, 
                   trade_threshold REAL DEFAULT 0.001)''')
+    
+    # FIXED: Schema migration for old DBs (rename binance to cex if needed)
+    try:
+        c.execute("PRAGMA table_info(user_api_keys)")
+        columns = [col[1] for col in c.fetchall()]
+        if 'binance_key' in columns and 'cex_key' not in columns:
+            logger.info("Migrating old binance columns to cex...")
+            c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_key TO cex_key")
+            c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_secret TO cex_secret")
+        # Add missing columns if old schema
+        if 'cex_key' not in columns:
+            c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_key TEXT")
+        if 'cex_secret' not in columns:
+            c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_secret TEXT")
+        logger.info("Schema migration complete.")
+    except Exception as e:
+        logger.warning(f"Schema migration skipped: {e}")
+    
     conn.commit()
     conn.close()
     logger.info("Database initialized with multi-user tables.")
