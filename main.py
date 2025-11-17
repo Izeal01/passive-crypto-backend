@@ -20,7 +20,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 # Set up logging
-logging.basicBaseConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)  # FIXED: Corrected to 'basicConfig' (was 'basicBaseConfig')
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
@@ -318,8 +318,8 @@ async def get_arbitrage(email: str = Query(...)):
     try:
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
-        cex_price = cex.fetch_ticker('XRP/USDT')['last']  # FIXED: CEX.IO uses 'XRP/USDT' (USDT pair)
-        kraken_price = kraken.fetch_ticker('XRP/USD')['last']  # Kraken uses 'XRP/USD'
+        cex_price = cex.fetch_ticker('XRP/USDT')['last']  # FIXED: CEX.IO 'XRP/USDT'
+        kraken_price = kraken.fetch_ticker('XRP/USD')['last']  # Kraken 'XRP/USD'
         spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)  # decimal
         spread_pct = spread * 100
         settings = load_user_settings(email)
@@ -349,8 +349,8 @@ async def get_balances(email: str = Query(...)):
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
         # FIXED: Safe get with default 0 if 'USD' not present (e.g., 'USDT' or no balance)
-        c_bal = cex.fetch_balance().get('USD', {'free': 0})['free']
-        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']
+        c_bal = cex.fetch_balance().get('USDT', {'free': 0})['free']  # FIXED: CEX.IO uses 'USDT'
+        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']  # Kraken uses 'USD'
         return {"cex_usd": c_bal, "kraken_usd": k_bal}
     except Exception as e:
         logger.error(f"Balances error for {email}: {e}")
