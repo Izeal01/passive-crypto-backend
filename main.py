@@ -20,7 +20,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)  # FIXED: Corrected to 'basicConfig' (was 'basicBaseConfig')
+logging.basicConfig(level=logging.INFO)  # FIXED: Corrected typo
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
@@ -122,12 +122,15 @@ class User(BaseModel):
 
 class Amount(BaseModel):
     amount: float = 100.0
+    email: str  # FIXED: Added for POST body
 
 class Toggle(BaseModel):
     enabled: bool
+    email: str  # FIXED: Added for POST body
 
 class Threshold(BaseModel):
     threshold: float = 0.001  # 0.1% decimal
+    email: str  # FIXED: Added for POST body
 
 class ClearRequest(BaseModel):
     email: str
@@ -349,8 +352,8 @@ async def get_balances(email: str = Query(...)):
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
         # FIXED: Safe get with default 0 if 'USD' not present (e.g., 'USDT' or no balance)
-        c_bal = cex.fetch_balance().get('USDT', {'free': 0})['free']  # FIXED: CEX.IO uses 'USDT'
-        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']  # Kraken uses 'USD'
+        c_bal = cex.fetch_balance().get('USDT', {'free': 0})['free']  # FIXED: CEX.IO 'USDT'
+        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']  # Kraken 'USD'
         return {"cex_usd": c_bal, "kraken_usd": k_bal}
     except Exception as e:
         logger.error(f"Balances error for {email}: {e}")
@@ -358,7 +361,8 @@ async def get_balances(email: str = Query(...)):
 
 # Updated: Per-user settings
 @app.post("/set_amount")
-async def set_amount(a: Amount, email: str = Query(...)):
+async def set_amount(a: Amount):  # FIXED: Use Body, email in payload
+    email = a.email
     if a.amount <= 0:
         raise HTTPException(status_code=400, detail="Amount must be positive")
     save_user_setting(email, trade_amount=a.amount)
@@ -366,7 +370,8 @@ async def set_amount(a: Amount, email: str = Query(...)):
     return {"status": "set", "amount": a.amount}
 
 @app.post("/toggle_auto_trade")
-async def toggle_auto_trade(t: Toggle, email: str = Query(...)):
+async def toggle_auto_trade(t: Toggle):  # FIXED: Use Body, email in payload
+    email = t.email
     save_user_setting(email, auto_trade_enabled=t.enabled)
     logger.info(f"Auto-trade {'enabled' if t.enabled else 'disabled'} for {email}")
     return {"status": "toggled", "enabled": t.enabled}
@@ -377,7 +382,8 @@ async def get_auto_trade_status(email: str = Query(...)):
     return {"enabled": settings['auto_trade_enabled']}
 
 @app.post("/set_threshold")
-async def set_threshold(t: Threshold, email: str = Query(...)):
+async def set_threshold(t: Threshold):  # FIXED: Use Body, email in payload
+    email = t.email
     if t.threshold < 0:
         raise HTTPException(status_code=400, detail="Threshold must be non-negative")
     save_user_setting(email, trade_threshold=t.threshold)
