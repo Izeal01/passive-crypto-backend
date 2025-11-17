@@ -20,7 +20,7 @@ import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicBaseConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
@@ -70,7 +70,7 @@ def init_db():
                   trade_amount REAL DEFAULT 100.0, auto_trade_enabled BOOLEAN DEFAULT FALSE, 
                   trade_threshold REAL DEFAULT 0.001)''')
     
-    # FIXED: Schema migration for old DBs (rename binance to cex if needed)
+    # Schema migration for old DBs (rename binance to cex if needed)
     try:
         c.execute("PRAGMA table_info(user_api_keys)")
         columns = [col[1] for col in c.fetchall()]
@@ -318,8 +318,8 @@ async def get_arbitrage(email: str = Query(...)):
     try:
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
-        cex_price = cex.fetch_ticker('XRP/USD')['last']  # CEX.IO symbol 'XRP/USD' (USDT equivalent)
-        kraken_price = kraken.fetch_ticker('XRP/USD')['last']
+        cex_price = cex.fetch_ticker('XRP/USDT')['last']  # FIXED: CEX.IO uses 'XRP/USDT' (USDT pair)
+        kraken_price = kraken.fetch_ticker('XRP/USD')['last']  # Kraken uses 'XRP/USD'
         spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)  # decimal
         spread_pct = spread * 100
         settings = load_user_settings(email)
@@ -348,8 +348,9 @@ async def get_balances(email: str = Query(...)):
     try:
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
-        c_bal = cex.fetch_balance()['USD']['free']  # CEX.IO uses USD
-        k_bal = kraken.fetch_balance()['USD']['free']
+        # FIXED: Safe get with default 0 if 'USD' not present (e.g., 'USDT' or no balance)
+        c_bal = cex.fetch_balance().get('USD', {'free': 0})['free']
+        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']
         return {"cex_usd": c_bal, "kraken_usd": k_bal}
     except Exception as e:
         logger.error(f"Balances error for {email}: {e}")
@@ -458,11 +459,11 @@ async def execute_arbitrage(email: str, c_price: float, k_price: float):
         kraken = ccxt.kraken(user_keys['kraken'])
         xrp_amount = settings['trade_amount'] / min(c_price, k_price)
         if c_price < k_price:
-            cex.create_market_buy_order('XRP/USD', xrp_amount)  # CEX.IO symbol 'XRP/USD'
+            cex.create_market_buy_order('XRP/USDT', xrp_amount)  # FIXED: CEX.IO 'XRP/USDT'
             kraken.create_market_sell_order('XRP/USD', xrp_amount)
         else:
             kraken.create_market_buy_order('XRP/USD', xrp_amount)
-            cex.create_market_sell_order('XRP/USD', xrp_amount)  # CEX.IO symbol 'XRP/USD'
+            cex.create_market_sell_order('XRP/USDT', xrp_amount)  # FIXED: CEX.IO 'XRP/USDT'
         logger.info(f"Trade executed for {email}!")
     except Exception as e:
         logger.error(f"Trade error for {email}: {e}")
