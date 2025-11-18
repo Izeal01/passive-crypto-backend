@@ -313,31 +313,58 @@ async def get_arbitrage(email: str = Query(...)):
     user_keys = load_user_keys(email)
     if not user_keys:
         return {"error": "API keys not loaded for this user"}
+
     try:
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
-        cex_price = cex.fetch_ticker('XRP/USDT')['last']  # FIXED: CEX.IO 'XRP/USDT'
-        kraken_price = kraken.fetch_ticker('XRP/USD')['last']  # Kraken 'XRP/USD'
-        spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)  # decimal
+
+        # Fetch prices with individual try/except so one rate-limit doesn't kill both
+        cex_price = None
+        kraken_price = None
+
+        try:
+            cex_price = cex.fetch_ticker('XRP/USDT')['last']
+        except Exception as e:
+            logger.warning(f"CEX.IO fetch failed: {e}")
+
+        try:
+            kraken_price = kraken.fetch_ticker('XRP/USD')['last']
+        except Exception as e:
+            logger.warning(f"Kraken fetch failed: {e}")
+
+        # If both failed
+        if cex_price is None and kraken_price is None:
+            return {"error": "Both exchanges rate-limited or unreachable"}
+
+        # If one failed, show partial data
+        if cex_price is None:
+            return {"kraken": kraken_price, "cex_error": "CEX.IO rate limit or error", "spread_pct": 0}
+        if kraken_price is None:
+            return {"cex": cex_price, "kraken_error": "Kraken rate limit or error", "spread_pct": 0}
+
+        spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)
         spread_pct = spread * 100
         settings = load_user_settings(email)
-        pnl_after_fees = spread - 0.002  # 0.2% fees decimal
+        pnl_after_fees = spread - 0.002
         roi_usdt = pnl_after_fees * settings['trade_amount']
-        logger.info(f"Arbitrage for {email}: CEX {cex_price:.4f}, Kraken {kraken_price:.4f}, Spread {spread_pct:.4f}%, PnL {pnl_after_fees*100:.4f}%")
+
+        logger.info(f"Arbitrage for {email}: CEX {cex_price:.4f} USDT, Kraken {kraken_price:.4f} USD, Spread {spread_pct:.4f}%")
         return {
             "cex": cex_price,
             "kraken": kraken_price,
             "spread": spread,
             "spread_pct": spread_pct,
-            "pnl": pnl_after_fees,  # decimal for >= check
+            "pnl": pnl_after_fees,
             "pnl_pct": pnl_after_fees * 100,
             "roi_usdt": roi_usdt
         }
-    except Exception as e:
-        logger.error(f"Arbitrage fetch error for {email}: {e}")
-        return {"error": str(e)}
 
-# Updated: Per-user balances
+    except Exception as e:
+        logger.error(f"Unexpected arbitrage error for {email}: {e}")
+        return {"error": "Temporary exchange issue — retrying..."}
+
+
+# Balances — already safe with .get()
 @app.get("/balances")
 async def get_balances(email: str = Query(...)):
     user_keys = load_user_keys(email)
@@ -346,13 +373,13 @@ async def get_balances(email: str = Query(...)):
     try:
         cex = ccxt.cex(user_keys['cex'])
         kraken = ccxt.kraken(user_keys['kraken'])
-        # FIXED: Safe get with default 0 if 'USD' not present (e.g., 'USDT' or no balance)
-        c_bal = cex.fetch_balance().get('USDT', {'free': 0})['free']  # FIXED: CEX.IO 'USDT'
-        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']  # Kraken 'USD'
+
+        c_bal = cex.fetch_balance().get('USDT', {'free': 0})['free']
+        k_bal = kraken.fetch_balance().get('USD', {'free': 0})['free']
         return {"cex_usd": c_bal, "kraken_usd": k_bal}
     except Exception as e:
-        logger.error(f"Balances error for {email}: {e}")
-        return {"error": str(e)}
+        logger.error(f"Balances error: {e}")
+        return {"error": "Exchange temporarily unreachable"}
 
 # Updated: Per-user settings
 @app.post("/set_amount")
