@@ -1,6 +1,6 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler  # For per-user rate limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import ccxt
@@ -15,24 +15,24 @@ from email.mime.multipart import MIMEMultipart
 import logging
 import os
 
-# Google Auth Imports (install: pip install firebase-admin)
+# Google Auth Imports
 import firebase_admin
 from firebase_admin import credentials, auth as firebase_auth
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)  # FIXED: Corrected typo
+# Logging (FIXED)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Passive Crypto Income Bot")
 
-# Rate limiter (100 req/min per IP; customize per-user later)
+# Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # "*" for production (allows all origins; restrict if needed)
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -40,26 +40,23 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# Initialize Firebase Admin (use env var for prod; fallback to local file for dev)
+# Firebase init
 try:
-    firebase_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')  # JSON string from env var
+    firebase_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
     if firebase_json:
-        import json as json_lib
-        cred_dict = json_lib.loads(firebase_json)
+        cred_dict = json.loads(firebase_json)
         cred = credentials.Certificate(cred_dict)
     else:
-        cred = credentials.Certificate("serviceAccountKey.json")  # Local fallback for dev
+        cred = credentials.Certificate("serviceAccountKey.json")
     if not firebase_admin._apps:
         firebase_admin.initialize_app(cred)
 except Exception as e:
-    logger.error(f"Firebase init failed: {e}")  # Graceful failure (app runs without Firebase if needed)
+    logger.error(f"Firebase init failed: {e}")
 
 def init_db():
-    db_path = os.environ.get('DB_PATH', 'users.db')  # Env var for DB path (e.g., /tmp/users.db on Render)
+    db_path = os.environ.get('DB_PATH', 'users.db')
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    
-    # Create tables if not exist
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys
@@ -70,7 +67,7 @@ def init_db():
                   trade_amount REAL DEFAULT 100.0, auto_trade_enabled BOOLEAN DEFAULT FALSE, 
                   trade_threshold REAL DEFAULT 0.001)''')
     
-    # Schema migration for old DBs (rename binance to cex if needed)
+    # Migration for old binance columns
     try:
         c.execute("PRAGMA table_info(user_api_keys)")
         columns = [col[1] for col in c.fetchall()]
@@ -78,14 +75,12 @@ def init_db():
             logger.info("Migrating old binance columns to cex...")
             c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_key TO cex_key")
             c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_secret TO cex_secret")
-        # Add missing columns if old schema
         if 'cex_key' not in columns:
             c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_key TEXT")
         if 'cex_secret' not in columns:
             c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_secret TEXT")
-        logger.info("Schema migration complete.")
     except Exception as e:
-        logger.warning(f"Schema migration skipped: {e}")
+        logger.warning(f"Migration skipped: {e}")
     
     conn.commit()
     conn.close()
@@ -476,5 +471,5 @@ async def execute_arbitrage(email: str, c_price: float, k_price: float):
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))  # Use env var for port (required for cloud like Render)
+    port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
