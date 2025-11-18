@@ -308,61 +308,74 @@ async def get_keys(email: str = Query(...)):
     return {}
 
 # Updated: Per-user arbitrage (load keys dynamically)
+_price_cache = {
+    'cex': {'price': None, 'timestamp': 0},
+    'kraken': {'price': None, 'timestamp': 0}
+}
+CACHE_TTL = 15  # seconds — safe for CEX.IO free tier
+
 @app.get("/arbitrage/")
 async def get_arbitrage(email: str = Query(...)):
     user_keys = load_user_keys(email)
     if not user_keys:
         return {"error": "API keys not loaded for this user"}
 
-    try:
-        cex = ccxt.cex(user_keys['cex'])
-        kraken = ccxt.kraken(user_keys['kraken'])
+    now = asyncio.get_event_loop().time()
+    cex_price = None
+    kraken_price = None
 
-        # Fetch prices with individual try/except so one rate-limit doesn't kill both
-        cex_price = None
-        kraken_price = None
-
+    # Try CEX.IO — if rate-limited or error, use cache
+    if now - _price_cache['cex']['timestamp'] < CACHE_TTL:
+        cex_price = _price_cache['cex']['price']
+    else:
         try:
+            cex = ccxt.cex(user_keys['cex'])
             cex_price = cex.fetch_ticker('XRP/USDT')['last']
+            _price_cache['cex'] = {'price': cex_price, 'timestamp': now}
         except Exception as e:
-            logger.warning(f"CEX.IO fetch failed: {e}")
+            logger.warning(f"CEX.IO failed ({e}), using cached price")
+            cex_price = _price_cache['cex']['price']  # may be None
 
+    # Kraken — more forgiving
+    if now - _price_cache['kraken']['timestamp'] < CACHE_TTL:
+        kraken_price = _price_cache['kraken']['price']
+    else:
         try:
+            kraken = ccxt.kraken(user_keys['kraken'])
             kraken_price = kraken.fetch_ticker('XRP/USD')['last']
+            _price_cache['kraken'] = {'price': kraken_price, 'timestamp': now}
         except Exception as e:
-            logger.warning(f"Kraken fetch failed: {e}")
+            logger.warning(f"Kraken failed ({e}), using cached price")
+            kraken_price = _price_cache['kraken']['price']
 
-        # If both failed
-        if cex_price is None and kraken_price is None:
-            return {"error": "Both exchanges rate-limited or unreachable"}
+    # If both missing → error
+    if cex_price is None and kraken_price is None:
+        return {"error": "Both exchanges temporarily unreachable"}
 
-        # If one failed, show partial data
-        if cex_price is None:
-            return {"kraken": kraken_price, "cex_error": "CEX.IO rate limit or error", "spread_pct": 0}
-        if kraken_price is None:
-            return {"cex": cex_price, "kraken_error": "Kraken rate limit or error", "spread_pct": 0}
-
+    # Calculate spread and ROI
+    if cex_price and kraken_price:
         spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)
         spread_pct = spread * 100
         settings = load_user_settings(email)
         pnl_after_fees = spread - 0.002
         roi_usdt = pnl_after_fees * settings['trade_amount']
 
-        logger.info(f"Arbitrage for {email}: CEX {cex_price:.4f} USDT, Kraken {kraken_price:.4f} USD, Spread {spread_pct:.4f}%")
+        logger.info(f"Arbitrage for {email}: CEX {cex_price:.4f} | Kraken {kraken_price:.4f} | Spread {spread_pct:.4f}% | ROI ${roi_usdt:.2f}")
         return {
             "cex": cex_price,
             "kraken": kraken_price,
-            "spread": spread,
-            "spread_pct": spread_pct,
-            "pnl": pnl_after_fees,
-            "pnl_pct": pnl_after_fees * 100,
-            "roi_usdt": roi_usdt
+            "spread_pct": round(spread_pct, 4),
+            "pnl_pct": round(pnl_after_fees * 100, 4),
+            "roi_usdt": round(roi_usdt, 2),   # ← This is what you wanted!
+            "profitable": pnl_after_fees > 0
         }
-
-    except Exception as e:
-        logger.error(f"Unexpected arbitrage error for {email}: {e}")
-        return {"error": "Temporary exchange issue — retrying..."}
-
+    else:
+        # Partial data
+        return {
+            "cex": cex_price,
+            "kraken": kraken_price,
+            "error": "One exchange rate-limited — using cached data"
+        }
 
 # Balances — already safe with .get()
 @app.get("/balances")
