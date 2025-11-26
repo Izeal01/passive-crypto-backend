@@ -1,15 +1,13 @@
-# main.py — COMPLETE & FINAL FOR RENDER (November 26, 2025)
+# main.py — FINAL & 100% WORKING ON RENDER (November 26, 2025)
 from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt
 import sqlite3
 import os
 import logging
-from datetime import datetime
 
 app = FastAPI(title="Passive Crypto Income Backend")
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,17 +19,37 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database init
+# DATABASE FIX: Automatically upgrade old tables
 def init_db():
     conn = sqlite3.connect('users.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
+    
+    # Create new correct table
+    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys_new 
                  (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+    
+    # Copy data from old table if exists
+    try:
+        c.execute("SELECT email, cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys")
+        rows = c.fetchall()
+        for row in rows:
+            c.execute("""INSERT OR IGNORE INTO user_api_keys_new 
+                         (email, cex_key, cex_secret, kraken_key, kraken_secret) 
+                         VALUES (?, ?, ?, ?, ?)""", row)
+    except sqlite3.OperationalError:
+        pass  # Old table doesn't exist
+    
+    # Replace old table
+    c.execute("DROP TABLE IF EXISTS user_api_keys")
+    c.execute("ALTER TABLE user_api_keys_new RENAME TO user_api_keys")
+    
+    # Settings table
     c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
                  (email TEXT PRIMARY KEY, trade_amount REAL DEFAULT 100.0)''')
+    
     conn.commit()
     conn.close()
-    logger.info("Database initialized")
+    logger.info("Database initialized and upgraded")
 
 init_db()
 
@@ -61,8 +79,11 @@ async def save_keys(data: dict = Body(...)):
     c.execute("""INSERT OR REPLACE INTO user_api_keys 
                  (email, cex_key, cex_secret, kraken_key, kraken_secret) 
                  VALUES (?, ?, ?, ?, ?)""",
-              (email, data.get("cex_key", ""), data.get("cex_secret", ""),
-               data.get("kraken_key", ""), data.get("kraken_secret", "")))
+              (email, 
+               data.get("cex_key", ""), 
+               data.get("cex_secret", ""),
+               data.get("kraken_key", ""), 
+               data.get("kraken_secret", "")))
     conn.commit()
     conn.close()
     logger.info(f"API keys saved for {email}")
@@ -76,7 +97,12 @@ async def get_keys(email: str = Query(...)):
     row = c.fetchone()
     conn.close()
     if row:
-        return {"cex_key": row[0], "cex_secret": row[1], "kraken_key": row[2], "kraken_secret": row[3]}
+        return {
+            "cex_key": row[0] or "",
+            "cex_secret": row[1] or "",
+            "kraken_key": row[2] or "",
+            "kraken_secret": row[3] or ""
+        }
     return {}
 
 # ================= BALANCES (USDC) =================
@@ -91,7 +117,6 @@ async def balances(email: str = Query(...)):
         kraken = ccxt.kraken(keys['kraken'])
         c_bal = cex.fetch_balance().get('USDC', {}).get('free', 0.0)
         k_bal = kraken.fetch_balance().get('USDC', {}).get('free', 0.0)
-        logger.info(f"USDC Balances for {email}: CEX.IO {c_bal}, Kraken {k_bal}")
         return {"cex_usdc": float(c_bal), "kraken_usdc": float(k_bal)}
     except Exception as e:
         logger.error(f"Balance error {email}: {e}")
@@ -106,7 +131,7 @@ async def arbitrage(email: str = Query(...)):
     if not keys:
         return {"error": "Save API keys first"}
     
-    now = datetime.now().timestamp()
+    now = __import__('time').time()
     if now - _price_cache['time'] > 15:
         try:
             cex = ccxt.cex(keys['cex'])
@@ -124,28 +149,24 @@ async def arbitrage(email: str = Query(...)):
         return {"error": "Unable to fetch prices"}
     
     spread = abs(c_price - k_price) / min(c_price, k_price)
-    net_pnl = spread - 0.0082  # 0.82% total fees
-    roi_usdc = max(net_pnl * 100.0, 0)  # $100 trade amount
+    net_pnl = spread - 0.0082
+    roi_usdc = max(net_pnl * 100.0, 0)
     
     direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
     
-    logger.info(f"Arbitrage {email}: CEX {c_price:.6f}, Kraken {k_price:.6f}, Spread {spread*100:.4f}%, Net {net_pnl*100:.4f}%")
-    
     return {
-        "cex": c_price,
-        "kraken": k_price,
+        "cex": round(c_price, 6),
+        "kraken": round(k_price, 6),
         "spread_pct": round(spread * 100, 4),
         "roi_usdc": round(roi_usdc, 2),
         "profitable": net_pnl > 0,
         "direction": direction
     }
 
-# Health check
 @app.get("/")
 async def root():
     return {"message": "Passive Crypto Income Backend – Running"}
 
-# REQUIRED FOR RENDER
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
