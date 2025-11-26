@@ -1,4 +1,5 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Query, Body
+# main.py — COMPLETE PASSIVE CRYPTO INCOME BACKEND (November 26, 2025)
+from fastapi import FastAPI, HTTPException, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
@@ -9,27 +10,36 @@ import json
 from pydantic import BaseModel
 import sqlite3
 from passlib.context import CryptContext
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import jwt
+from datetime import datetime, timedelta
 import logging
 import os
 
-# Google Auth Imports
-import firebase_admin
-from firebase_admin import credentials, auth as firebase_auth
+# Firebase for Google Auth (optional)
+try:
+    import firebase_admin
+    from firebase_admin import credentials, auth as firebase_auth
+    firebase_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+    if firebase_json:
+        cred_dict = json.loads(firebase_json)
+        cred = credentials.Certificate(cred_dict)
+        if not firebase_admin._apps:
+            firebase_admin.initialize_app(cred)
+except Exception as e:
+    print(f"Firebase optional: {e}")
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Passive Crypto Income Bot")
+app = FastAPI(title="Passive Crypto Income Backend")
 
 # Rate limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,179 +48,271 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Security
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+SECRET_KEY = os.environ.get("JWT_SECRET", "super-secret-jwt-key-change-this-in-prod")
+ALGORITHM = "HS256"
 
-# Firebase init
-try:
-    firebase_json = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-    if firebase_json:
-        cred_dict = json.loads(firebase_json)
-        cred = credentials.Certificate(cred_dict)
-    else:
-        cred = credentials.Certificate("serviceAccountKey.json")
-    if not firebase_admin._apps:
-        firebase_admin.initialize_app(cred)
-except Exception as e:
-    logger.error(f"Firebase init failed: {e}")
-
+# Database
 def init_db():
     db_path = os.environ.get('DB_PATH', 'users.db')
     conn = sqlite3.connect(db_path)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
-                  cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS user_settings
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT UNIQUE NOT NULL, 
-                  trade_amount REAL DEFAULT 100.0, auto_trade_enabled BOOLEAN DEFAULT FALSE, 
-                  trade_threshold REAL DEFAULT 0.001)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (email TEXT PRIMARY KEY, password TEXT NOT NULL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
+                 (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
+                 (email TEXT PRIMARY KEY, trade_amount REAL DEFAULT 100.0, auto_trade BOOLEAN DEFAULT FALSE, threshold REAL DEFAULT 0.001)''')
     
     # Migration for old columns
     try:
         c.execute("PRAGMA table_info(user_api_keys)")
         columns = [col[1] for col in c.fetchall()]
-        if 'binance_key' in columns and 'cex_key' not in columns:
-            logger.info("Migrating old binance columns to cex...")
+        if 'binance_key' in columns:
             c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_key TO cex_key")
             c.execute("ALTER TABLE user_api_keys RENAME COLUMN binance_secret TO cex_secret")
-        if 'cex_key' not in columns:
-            c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_key TEXT")
-        if 'cex_secret' not in columns:
-            c.execute("ALTER TABLE user_api_keys ADD COLUMN cex_secret TEXT")
-    except Exception as e:
-        logger.warning(f"Migration skipped: {e}")
+    except:
+        pass
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized.")
+    logger.info("Database initialized")
 
 init_db()
 
-# Helper functions (unchanged from previous)
-def load_user_keys(email):
-    db_path = os.environ.get('DB_PATH', 'users.db')
-    conn = sqlite3.connect(db_path)
+# Models
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+# JWT
+def create_token(email: str):
+    expire = datetime.utcnow() + timedelta(hours=24)
+    return jwt.encode({"sub": email, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_user_keys(email: str):
+    conn = sqlite3.connect('users.db')
     c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
-    result = c.fetchone()
+    row = c.fetchone()
     conn.close()
-    if result:
-        return {
-            'cex': {'apiKey': result[0], 'secret': result[1]},
-            'kraken': {'apiKey': result[2], 'secret': result[3]}
-        }
+    if row:
+        return {'cex': {'apiKey': row[0], 'secret': row[1]}, 'kraken': {'apiKey': row[2], 'secret': row[3]}}
     return None
 
-def load_user_settings(email):
-    db_path = os.environ.get('DB_PATH', 'users.db')
-    conn = sqlite3.connect(db_path)
+def get_user_settings(email: str):
+    conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    c.execute("SELECT trade_amount FROM user_settings WHERE email=?", (email,))
+    c.execute("SELECT trade_amount, auto_trade, threshold FROM user_settings WHERE email=?", (email,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {'trade_amount': row[0], 'auto_trade': bool(row[1]), 'threshold': row[2]}
+    return {'trade_amount': 100.0, 'auto_trade': False, 'threshold': 0.001}
+
+# ================= AUTH =================
+@app.post("/login")
+@limiter.limit("5/minute")
+async def login(user: UserLogin):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT password FROM users WHERE email=?", (user.email,))
     result = c.fetchone()
     conn.close()
-    return {'trade_amount': result[0] if result else 100.0}
+    
+    if not result or not pwd_context.verify(user.password, result[0]):
+        raise HTTPException(400, "Invalid credentials")
+    
+    token = create_token(user.email)
+    return {"status": "logged in", "token": token, "email": user.email}
 
-# FIXED: USDC Balances (shows $20.03 on CEX.IO now)
-@app.get("/balances")
-async def get_balances(email: str = Query(...)):
-    user_keys = load_user_keys(email)
-    if not user_keys:
-        return {"error": "API keys not loaded for this user"}
+@app.post("/signup")
+@limiter.limit("5/minute")
+async def signup(user: UserLogin):
+    hashed = pwd_context.hash(user.password)
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
     try:
-        cex = ccxt.cex(user_keys['cex'])
-        kraken = ccxt.kraken(user_keys['kraken'])
-        cex_balance = cex.fetch_balance()
-        kraken_balance = kraken.fetch_balance()
-        # FIXED: Fetch USDC (not USDT/USD) - matches your $20.03 screenshot
-        c_bal = cex_balance.get('USDC', {'free': 0}).get('free', 0)
-        k_bal = kraken_balance.get('USDC', {'free': 0}).get('free', 0)
-        logger.info(f"USDC Balances for {email}: CEX.IO {c_bal}, Kraken {k_bal}")
-        return {"cex_usdc": c_bal, "kraken_usdc": k_bal}
+        c.execute("INSERT INTO users (email, password) VALUES (?, ?)", (user.email, hashed))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise HTTPException(400, "Email already exists")
+    conn.close()
+    
+    token = create_token(user.email)
+    return {"status": "user created", "token": token, "email": user.email}
+
+@app.post("/google_login")
+@limiter.limit("5/minute")
+async def google_login(data: dict = Body(...)):
+    id_token = data.get("id_token")
+    if not id_token:
+        raise HTTPException(400, "No ID token")
+    
+    try:
+        decoded = firebase_auth.verify_id_token(id_token)
+        email = decoded['email']
+        conn = sqlite3.connect('users.db')
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO users (email, password) VALUES (?, ?)", (email, ''))
+        conn.commit()
+        conn.close()
+        token = create_token(email)
+        return {"status": "logged in", "token": token, "email": email}
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+# ================= API KEYS =================
+@app.post("/save_keys")
+@limiter.limit("10/minute")
+async def save_keys(data: dict = Body(...)):
+    email = data.get("email")
+    if not email:
+        raise HTTPException(400, "No email")
+    
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO user_api_keys 
+                 (email, cex_key, cex_secret, kraken_key, kraken_secret) 
+                 VALUES (?, ?, ?, ?, ?)""",
+              (email, data.get("cex_key", ""), data.get("cex_secret", ""),
+               data.get("kraken_key", ""), data.get("kraken_secret", "")))
+    conn.commit()
+    conn.close()
+    logger.info(f"Keys saved for {email}")
+    return {"status": "keys saved"}
+
+@app.get("/get_keys")
+@limiter.limit("10/minute")
+async def get_keys(email: str = Query(...)):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {"cex_key": row[0], "cex_secret": row[1], "kraken_key": row[2], "kraken_secret": row[3]}
+    return {}
+
+# ================= SETTINGS =================
+@app.post("/set_amount")
+@limiter.limit("20/minute")
+async def set_amount(data: dict = Body(...)):
+    email = data.get("email")
+    amount = float(data.get("amount", 100.0))
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_settings (email, trade_amount) VALUES (?, ?)", (email, amount))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.post("/toggle_auto_trade")
+@limiter.limit("20/minute")
+async def toggle_auto_trade(data: dict = Body(...)):
+    email = data.get("email")
+    enabled = bool(data.get("enabled", False))
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_settings (email, auto_trade) VALUES (?, ?)", (email, enabled))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.post("/set_threshold")
+@limiter.limit("20/minute")
+async def set_threshold(data: dict = Body(...)):
+    email = data.get("email")
+    threshold = float(data.get("threshold", 0.001))
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO user_settings (email, threshold) VALUES (?, ?)", (email, threshold))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# ================= BALANCES =================
+@app.get("/balances")
+@limiter.limit("30/minute")
+async def balances(email: str = Query(...)):
+    keys = get_user_keys(email)
+    if not keys:
+        return {"error": "No API keys found. Save keys first."}
+    
+    try:
+        cex = ccxt.cex(keys['cex'])
+        kraken = ccxt.kraken(keys['kraken'])
+        c_balance = cex.fetch_balance()
+        k_balance = kraken.fetch_balance()
+        c_usdc = c_balance.get('USDC', {}).get('free', 0)
+        k_usdc = k_balance.get('USDC', {}).get('free', 0)
+        logger.info(f"Balances for {email}: CEX {c_usdc}, Kraken {k_usdc}")
+        return {"cex_usdc": c_usdc, "kraken_usdc": k_usdc}
     except Exception as e:
         logger.error(f"Balances error for {email}: {e}")
         return {"error": str(e)}
 
-# FIXED: USDC-XRP-USDC Arb with Full Fees (0.82% total round-trip)
-_price_cache = {
-    'cex': {'price': None, 'timestamp': 0},
-    'kraken': {'price': None, 'timestamp': 0}
-}
+# ================= ARBITRAGE =================
+_price_cache = {'cex': 0, 'kraken': 0}
 CACHE_TTL = 15  # seconds
 
-# Fees: CEX.IO (0.25% taker), Kraken (0.26% taker) - total 0.51% per leg x2 = 1.02%, but use conservative 0.82% net
-TOTAL_ROUND_TRIP_FEES = 0.0082  # Research-confirmed low-volume max
-
-@app.get("/arbitrage/")
-async def get_arbitrage(email: str = Query(...)):
-    user_keys = load_user_keys(email)
-    if not user_keys:
-        return {"error": "API keys not loaded for this user"}
-
+@app.get("/arbitrage")
+@limiter.limit("15/minute")  # Safe for free tiers
+async def arbitrage(email: str = Query(...)):
+    keys = get_user_keys(email)
+    if not keys:
+        return {"error": "No API keys found. Save keys first."}
+    
     now = asyncio.get_event_loop().time()
-    cex_price = None  # XRP price in USDC on CEX
-    kraken_price = None  # XRP price in USDC on Kraken
-
-    # CEX.IO: Cache or fetch XRP/USDC
-    if now - _price_cache['cex']['timestamp'] < CACHE_TTL:
-        cex_price = _price_cache['cex']['price']
-    else:
+    cex_price = _price_cache.get('cex')
+    kraken_price = _price_cache.get('kraken')
+    
+    if now - _price_cache['cex'] > CACHE_TTL:
         try:
-            cex = ccxt.cex(user_keys['cex'])
+            cex = ccxt.cex(keys['cex'])
             cex_price = cex.fetch_ticker('XRP/USDC')['last']
-            _price_cache['cex'] = {'price': cex_price, 'timestamp': now}
+            _price_cache['cex'] = cex_price
+            _price_cache['cex_time'] = now
         except Exception as e:
-            logger.warning(f"CEX.IO failed ({e}), using cache")
-            cex_price = _price_cache['cex']['price']
-
-    # Kraken: Cache or fetch XRP/USDC
-    if now - _price_cache['kraken']['timestamp'] < CACHE_TTL:
-        kraken_price = _price_cache['kraken']['price']
-    else:
+            logger.warning(f"CEX price fetch failed: {e}")
+    
+    if now - _price_cache['kraken'] > CACHE_TTL:
         try:
-            kraken = ccxt.kraken(user_keys['kraken'])
+            kraken = ccxt.kraken(keys['kraken'])
             kraken_price = kraken.fetch_ticker('XRP/USDC')['last']
-            _price_cache['kraken'] = {'price': kraken_price, 'timestamp': now}
+            _price_cache['kraken'] = kraken_price
+            _price_cache['kraken_time'] = now
         except Exception as e:
-            logger.warning(f"Kraken failed ({e}), using cache")
-            kraken_price = _price_cache['kraken']['price']
-
-    if cex_price is None and kraken_price is None:
-        return {"error": "Both exchanges unreachable"}
-
-    if cex_price and kraken_price:
-        # Assume buy low on cheaper (e.g., CEX if cex_price < kraken_price), sell high
-        low_price, high_price = min(cex_price, kraken_price), max(cex_price, kraken_price)
-        spread = (high_price - low_price) / low_price
-        gross_pnl = spread
-        net_pnl = gross_pnl - TOTAL_ROUND_TRIP_FEES  # Net after 4 trades (2 buy/sell legs)
-        settings = load_user_settings(email)
-        roi_usdc = net_pnl * settings['trade_amount'] if net_pnl > 0 else 0  # Only if profitable
-
-        logger.info(f"USDC Arb for {email}: CEX {cex_price:.6f} | Kraken {kraken_price:.6f} | Net Spread {net_pnl*100:.4f}% | ROI ${roi_usdc:.2f}")
-        if net_pnl > 0:
-            return {
-                "cex": cex_price,
-                "kraken": kraken_price,
-                "spread_pct": round(spread * 100, 4),
-                "net_pnl_pct": round(net_pnl * 100, 4),
-                "roi_usdc": round(roi_usdc, 2),
-                "profitable": True,
-                "direction": "Buy CEX, Sell Kraken" if cex_price < kraken_price else "Buy Kraken, Sell CEX"
-            }
-        else:
-            return {"error": "No profitable opportunity after fees (spread too low)"}
-
-    # Partial data fallback
+            logger.warning(f"Kraken price fetch failed: {e}")
+    
+    if cex_price is None or kraken_price is None:
+        return {"error": "Unable to fetch prices from exchanges"}
+    
+    spread = abs(cex_price - kraken_price) / min(cex_price, kraken_price)
+    settings = get_user_settings(email)
+    net_pnl = spread - 0.0082  # 0.82% round-trip fees
+    roi_usdc = net_pnl * settings['trade_amount'] if net_pnl > 0 else 0
+    
+    direction = "Buy CEX.IO → Sell Kraken" if cex_price < kraken_price else "Buy Kraken → Sell CEX.IO"
+    
+    logger.info(f"Arbitrage for {email}: CEX ${cex_price:.6f}, Kraken ${kraken_price:.6f}, Spread {spread*100:.4f}%, Net {net_pnl*100:.4f}%")
+    
     return {
         "cex": cex_price,
         "kraken": kraken_price,
-        "error": "Partial data - using cache"
+        "spread_pct": round(spread * 100, 4),
+        "net_pnl_pct": round(net_pnl * 100, 4),
+        "roi_usdc": round(roi_usdc, 2),
+        "profitable": net_pnl > 0,
+        "direction": direction
     }
 
-# Other endpoints unchanged (login, save keys, etc.)
-# ... (add your existing POST /login, POST /save_keys, etc.)
+# Health
+@app.get("/")
+async def root():
+    return {"message": "Passive Crypto Income Backend v1.0 – Ready for Arbitrage"}
 
 if __name__ == "__main__":
     import uvicorn
