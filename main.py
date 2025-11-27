@@ -1,12 +1,12 @@
-# main.py — FINAL & 100% WORKING ON RENDER (November 26, 2025)
-from fastapi import FastAPI, HTTPException, Query, Body
+# main.py — FINAL WORKING VERSION FOR RENDER
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt
 import sqlite3
 import os
 import logging
 
-app = FastAPI(title="Passive Crypto Income Backend")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,57 +19,51 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DATABASE FIX: Automatically upgrade old tables
+# Database init + fix old structure
 def init_db():
     conn = sqlite3.connect('users.db', check_same_thread=False)
     c = conn.cursor()
     
-    # Create new correct table
-    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys_new 
+    # Fix old table if exists
+    try:
+        c.execute("SELECT * FROM user_api_keys LIMIT 1")
+        c.execute("ALTER TABLE user_api_keys RENAME TO user_api_keys_old")
+    except:
+        pass
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
                  (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
     
-    # Copy data from old table if exists
+    # Migrate data
     try:
-        c.execute("SELECT email, cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys")
-        rows = c.fetchall()
-        for row in rows:
-            c.execute("""INSERT OR IGNORE INTO user_api_keys_new 
-                         (email, cex_key, cex_secret, kraken_key, kraken_secret) 
-                         VALUES (?, ?, ?, ?, ?)""", row)
-    except sqlite3.OperationalError:
-        pass  # Old table doesn't exist
-    
-    # Replace old table
-    c.execute("DROP TABLE IF EXISTS user_api_keys")
-    c.execute("ALTER TABLE user_api_keys_new RENAME TO user_api_keys")
-    
-    # Settings table
-    c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
-                 (email TEXT PRIMARY KEY, trade_amount REAL DEFAULT 100.0)''')
+        c.execute("SELECT * FROM user_api_keys_old")
+        for row in c.fetchall():
+            c.execute("INSERT OR IGNORE INTO user_api_keys VALUES (?, ?, ?, ?, ?)", row)
+        c.execute("DROP TABLE user_api_keys_old")
+    except:
+        pass
     
     conn.commit()
     conn.close()
-    logger.info("Database initialized and upgraded")
 
 init_db()
 
-# Helper
 def get_keys(email: str):
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
     conn.close()
-    if row:
+    if row and row[0] and row[2]:
         return {
-            'cex': {'apiKey': row[0], 'secret': row[1]},
-            'kraken': {'apiKey': row[2], 'secret': row[3]}
+            'cex': {'apiKey': row[0], 'secret': row[1] or ''},
+            'kraken': {'apiKey': row[2], 'secret': row[3] or ''}
         }
     return None
 
 # ================= API KEYS =================
 @app.post("/save_keys")
-async def save_keys(data: dict = Body(...)):
+async def save_keys(data: dict):
     email = data.get("email")
     if not email:
         raise HTTPException(400, "Email required")
@@ -86,7 +80,7 @@ async def save_keys(data: dict = Body(...)):
                data.get("kraken_secret", "")))
     conn.commit()
     conn.close()
-    logger.info(f"API keys saved for {email}")
+    logger.info(f"Keys saved for {email}")
     return {"status": "saved"}
 
 @app.get("/get_keys")
@@ -105,7 +99,7 @@ async def get_keys(email: str = Query(...)):
         }
     return {}
 
-# ================= BALANCES (USDC) =================
+# ================= BALANCES (USDC ONLY) =================
 @app.get("/balances")
 async def balances(email: str = Query(...)):
     keys = get_keys(email)
@@ -119,10 +113,10 @@ async def balances(email: str = Query(...)):
         k_bal = kraken.fetch_balance().get('USDC', {}).get('free', 0.0)
         return {"cex_usdc": float(c_bal), "kraken_usdc": float(k_bal)}
     except Exception as e:
-        logger.error(f"Balance error {email}: {e}")
+        logger.error(f"Balance error: {e}")
         return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
 
-# ================= ARBITRAGE (USDC-XRP-USDC) =================
+# ================= ARBITRAGE (USDC-XRP-USDC + NET PROFIT) =================
 _price_cache = {'cex': None, 'kraken': None, 'time': 0}
 
 @app.get("/arbitrage")
@@ -140,32 +134,31 @@ async def arbitrage(email: str = Query(...)):
             k_price = kraken.fetch_ticker('XRP/USDC')['last']
             _price_cache.update({'cex': c_price, 'kraken': k_price, 'time': now})
         except Exception as e:
-            logger.warning(f"Price fetch failed: {e}")
+            logger.warning(f"Price error: {e}")
     
     c_price = _price_cache['cex']
     k_price = _price_cache['kraken']
     
     if not c_price or not k_price:
-        return {"error": "Unable to fetch prices"}
+        return {"error": "Price unavailable"}
     
     spread = abs(c_price - k_price) / min(c_price, k_price)
     net_pnl = spread - 0.0082
-    roi_usdc = max(net_pnl * 100.0, 0)
-    
+    roi = max(net_pnl * 100.0, 0)
     direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
     
     return {
         "cex": round(c_price, 6),
         "kraken": round(k_price, 6),
         "spread_pct": round(spread * 100, 4),
-        "roi_usdc": round(roi_usdc, 2),
+        "roi_usdc": round(roi, 2),
         "profitable": net_pnl > 0,
         "direction": direction
     }
 
 @app.get("/")
 async def root():
-    return {"message": "Passive Crypto Income Backend – Running"}
+    return {"message": "Backend Running"}
 
 if __name__ == "__main__":
     import uvicorn
