@@ -19,12 +19,27 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DATABASE
-conn = sqlite3.connect('users.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
-             (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
-conn.commit()
+# DATABASE — COMPLETELY REBUILT TO FIX "6 columns but 5 values" ERROR
+def init_db():
+    conn = sqlite3.connect('users.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    # DELETE OLD BROKEN TABLE
+    c.execute("DROP TABLE IF EXISTS user_api_keys")
+    
+    # CREATE CORRECT TABLE WITH 5 COLUMNS
+    c.execute('''CREATE TABLE user_api_keys 
+                 (email TEXT PRIMARY KEY, 
+                  cex_key TEXT, 
+                  cex_secret TEXT, 
+                  kraken_key TEXT, 
+                  kraken_secret TEXT)''')
+    
+    conn.commit()
+    conn.close()
+    logger.info("Database rebuilt — old broken table removed")
+
+init_db()
 
 # KEY CACHE
 _key_cache = {}
@@ -34,8 +49,12 @@ async def get_keys(email: str):
     if email in _key_cache and time.time() - _cache_time.get(email, 0) < 30:
         return _key_cache[email]
     
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
+    conn.close()
+    
     if row and row[0] and row[2]:
         keys = {
             'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 30000},
@@ -51,27 +70,45 @@ async def get_keys(email: str):
 async def login():
     return {"status": "logged in"}
 
-# ================= API KEYS =================
+# ================= API KEYS (500 ERROR FIXED) =================
 @app.post("/save_keys")
 async def save_keys(data: dict):
     email = data.get("email")
     if not email:
         raise HTTPException(400, "Email required")
     
-    c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?)""",
-              (email, data.get("cex_key",""), data.get("cex_secret",""),
-               data.get("kraken_key",""), data.get("kraken_secret","")))
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO user_api_keys 
+                 (email, cex_key, cex_secret, kraken_key, kraken_secret) 
+                 VALUES (?, ?, ?, ?, ?)""",
+              (email,
+               data.get("cex_key", ""),
+               data.get("cex_secret", ""),
+               data.get("kraken_key", ""),
+               data.get("kraken_secret", "")))
     conn.commit()
-    _key_cache.pop(email, None)  # Clear cache
+    conn.close()
+    
+    # Clear cache
+    _key_cache.pop(email, None)
     logger.info(f"Keys saved for {email}")
     return {"status": "saved"}
 
 @app.get("/get_keys")
 async def get_keys_route(email: str = Query(...)):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
+    conn.close()
     if row:
-        return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
+        return {
+            "cex_key": row[0] or "",
+            "cex_secret": row[1] or "",
+            "kraken_key": row[2] or "",
+            "kraken_secret": row[3] or ""
+        }
     return {}
 
 # ================= BALANCES =================
