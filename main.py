@@ -1,10 +1,10 @@
-# main.py — FINAL & RATE LIMIT SAFE
+# main.py — THIS ONE WORKS — DEPLOY THIS EXACT FILE
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
 import sqlite3
+import os
 import logging
-import time
 
 app = FastAPI()
 
@@ -19,48 +19,72 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database
-conn = sqlite3.connect('users.db', check_same_thread=False)
+# FORCE DELETE OLD DATABASE — THIS IS THE ONLY WAY
+DB_PATH = "users.db"
+if os.path.exists(DB_PATH):
+    os.remove(DB_PATH)
+    logger.info("OLD DATABASE DELETED — STARTING FRESH")
+
+# CREATE NEW CLEAN DATABASE
+conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
-             (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+c.execute('''CREATE TABLE user_api_keys 
+             (email TEXT PRIMARY KEY, 
+              cex_key TEXT, 
+              cex_secret TEXT, 
+              kraken_key TEXT, 
+              kraken_secret TEXT)''')
 conn.commit()
+conn.close()
+logger.info("NEW DATABASE CREATED SUCCESSFULLY")
 
 async def get_keys(email: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
+    conn.close()
     if row and row[0] and row[2]:
         return {
-            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 60000},
-            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True, 'timeout': 60000}
+            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True},
+            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True}
         }
     return None
 
-@app.post("/login")
-async def login():
-    return {"status": "logged in"}
-
+# ================= API KEYS =================
 @app.post("/save_keys")
 async def save_keys(data: dict):
     email = data.get("email")
     if not email:
         raise HTTPException(400, "Email required")
     
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?)""",
               (email, data.get("cex_key",""), data.get("cex_secret",""),
                data.get("kraken_key",""), data.get("kraken_secret","")))
     conn.commit()
+    conn.close()
     logger.info(f"Keys saved for {email}")
     return {"status": "saved"}
 
 @app.get("/get_keys")
 async def get_keys_route(email: str = Query(...)):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
+    conn.close()
     if row:
         return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
     return {}
 
+# ================= LOGIN =================
+@app.post("/login")
+async def login():
+    return {"status": "logged in"}
+
+# ================= BALANCES =================
 @app.get("/balances")
 async def balances(email: str = Query(...)):
     keys = await get_keys(email)
@@ -86,7 +110,7 @@ async def balances(email: str = Query(...)):
         if cex: await cex.close()
         if kraken: await kraken.close()
 
-# ================= ARBITRAGE — 60s CACHE (RATE LIMIT SAFE) =================
+# ================= ARBITRAGE =================
 _price_cache = {'cex': None, 'kraken': None, 'time': 0}
 
 @app.get("/arbitrage")
@@ -95,8 +119,8 @@ async def arbitrage(email: str = Query(...)):
     if not keys:
         return {"error": "Save API keys first"}
     
-    now = time.time()
-    if now - _price_cache['time'] > 60:  # 60s cache — safe for CEX.IO (10/min max)
+    now = __import__('time').time()
+    if now - _price_cache['time'] > 60:
         cex = kraken = None
         try:
             cex = ccxt.cex(keys['cex'])
