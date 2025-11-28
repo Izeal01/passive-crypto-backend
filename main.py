@@ -2,8 +2,10 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
+import asyncio
 import sqlite3
 import logging
+import time
 
 app = FastAPI()
 
@@ -18,41 +20,31 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FINAL DATABASE RESET — Fixes "no such column: cex_key" forever
-def reset_database():
-    conn = sqlite3.connect('users.db', check_same_thread=False)
-    c = conn.cursor()
-    
-    # DELETE ALL OLD TABLES
-    c.execute("DROP TABLE IF EXISTS user_api_keys")
-    c.execute("DROP TABLE IF EXISTS user_api_keys_old")
-    c.execute("DROP TABLE IF EXISTS temp_old_keys")
-    
-    # CREATE CORRECT TABLE
-    c.execute('''CREATE TABLE user_api_keys 
-                 (email TEXT PRIMARY KEY, 
-                  cex_key TEXT, 
-                  cex_secret TEXT, 
-                  kraken_key TEXT, 
-                  kraken_secret TEXT)''')
-    
-    conn.commit()
-    conn.close()
-    logger.info("Database fully reset — ready for clean keys")
+# DATABASE — CLEAN & CORRECT
+conn = sqlite3.connect('users.db', check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
+             (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+conn.commit()
 
-reset_database()  # ← THIS IS THE FIX
+# KEY CACHE + RATE LIMIT PROTECTION
+_key_cache = {}
+_cache_time = {}
 
 async def get_keys(email: str):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
+    if email in _key_cache and time.time() - _cache_time.get(email, 0) < 30:
+        return _key_cache[email]
+    
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
-    conn.close()
     if row and row[0] and row[2]:
-        return {
-            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 30000},
-            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True, 'timeout': 30000}
+        keys = {
+            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 60000, 'rateLimit': 1200},
+            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True, 'timeout': 60000}
         }
+        _key_cache[email] = keys
+        _cache_time[email] = time.time()
+        return keys
     return None
 
 # ================= LOGIN =================
@@ -67,38 +59,23 @@ async def save_keys(data: dict):
     if not email:
         raise HTTPException(400, "Email required")
     
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO user_api_keys 
-                 (email, cex_key, cex_secret, kraken_key, kraken_secret) 
-                 VALUES (?, ?, ?, ?, ?)""",
-              (email,
-               data.get("cex_key", ""),
-               data.get("cex_secret", ""),
-               data.get("kraken_key", ""),
-               data.get("kraken_secret", "")))
+    c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?)""",
+              (email, data.get("cex_key",""), data.get("cex_secret",""),
+               data.get("kraken_key",""), data.get("kraken_secret","")))
     conn.commit()
-    conn.close()
+    _key_cache.pop(email, None)
     logger.info(f"Keys saved for {email}")
     return {"status": "saved"}
 
 @app.get("/get_keys")
 async def get_keys_route(email: str = Query(...)):
-    conn = sqlite3.connect('users.db')
-    c = conn.cursor()
     c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
-    conn.close()
     if row:
-        return {
-            "cex_key": row[0] or "",
-            "cex_secret": row[1] or "",
-            "kraken_key": row[2] or "",
-            "kraken_secret": row[3] or ""
-        }
+        return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
     return {}
 
-# ================= BALANCES =================
+# ================= BALANCES — FIXED =================
 @app.get("/balances")
 async def balances(email: str = Query(...)):
     keys = await get_keys(email)
@@ -109,8 +86,8 @@ async def balances(email: str = Query(...)):
     try:
         cex = ccxt.cex(keys['cex'])
         kraken = ccxt.kraken(keys['kraken'])
-        await cex.load_markets()
-        await kraken.load_markets()
+        await asyncio.gather(cex.load_markets(), kraken.load_markets())
+        
         c_bal = await cex.fetch_balance()
         k_bal = await kraken.fetch_balance()
         
@@ -125,7 +102,7 @@ async def balances(email: str = Query(...)):
         if cex: await cex.close()
         if kraken: await kraken.close()
 
-# ================= ARBITRAGE =================
+# ================= ARBITRAGE — FIXED WITH 60s CACHE =================
 _price_cache = {'cex': None, 'kraken': None, 'time': 0}
 
 @app.get("/arbitrage")
@@ -134,16 +111,17 @@ async def arbitrage(email: str = Query(...)):
     if not keys:
         return {"error": "Save API keys first"}
     
-    now = __import__('time').time()
-    if now - _price_cache['time'] > 30:
+    now = time.time()
+    if now - _price_cache['time'] > 60:  # 60-second cache to avoid CEX.IO rate limit
         cex = kraken = None
         try:
             cex = ccxt.cex(keys['cex'])
             kraken = ccxt.kraken(keys['kraken'])
-            await cex.load_markets()
-            await kraken.load_markets()
+            await asyncio.gather(cex.load_markets(), kraken.load_markets())
+            
             c_price = (await cex.fetch_ticker('XRP/USDC'))['last']
             k_price = (await kraken.fetch_ticker('XRP/USDC'))['last']
+            
             _price_cache.update({'cex': c_price, 'kraken': k_price, 'time': now})
         except Exception as e:
             logger.warning(f"Price error: {e}")
