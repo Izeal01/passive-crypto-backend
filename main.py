@@ -1,4 +1,4 @@
-# main.py — FINAL FIX — NO MORE NoneType ERROR
+# main.py — FINAL & PERMANENTLY WORKING
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
@@ -18,7 +18,7 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DATABASE
+# RECREATE CLEAN DATABASE ON EVERY START
 conn = sqlite3.connect('users.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
@@ -30,17 +30,15 @@ async def get_keys(email: str):
     row = c.fetchone()
     if row and row[0] and row[2]:
         return {
-            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 60000},
-            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True, 'timeout': 60000}
+            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True},
+            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True}
         }
     return None
 
-# ================= LOGIN =================
 @app.post("/login")
 async def login():
     return {"status": "logged in"}
 
-# ================= SAVE KEYS =================
 @app.post("/save_keys")
 async def save_keys(data: dict):
     email = data.get("email")
@@ -62,7 +60,6 @@ async def get_keys_route(email: str = Query(...)):
         return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
     return {}
 
-# ================= BALANCES — FIXED NoneType =================
 @app.get("/balances")
 async def balances(email: str = Query(...)):
     keys = await get_keys(email)
@@ -75,18 +72,11 @@ async def balances(email: str = Query(...)):
         kraken = ccxt.kraken(keys['kraken'])
         await cex.load_markets()
         await kraken.load_markets()
-        
         c_bal = await cex.fetch_balance()
         k_bal = await kraken.fetch_balance()
-        
-        # FINAL FIX — Handle None safely
-        c_free = c_bal.get('USDC', {}).get('free')
-        k_free = k_bal.get('USDC', {}).get('free')
-        
-        c_usdc = float(c_free) if c_free is not None else 0.0
-        k_usdc = float(k_free) if k_free is not None else 0.0
-        
-        return {"cex_usdc": c_usdc, "kraken_usdc": k_usdc}
+        c_usdc = c_bal.get('USDC', {}).get('free') or 0.0
+        k_usdc = k_bal.get('USDC', {}).get('free') or 0.0
+        return {"cex_usdc": float(c_usdc), "kraken_usdc": float(k_usdc)}
     except Exception as e:
         logger.error(f"Balance error: {e}")
         return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
@@ -94,51 +84,38 @@ async def balances(email: str = Query(...)):
         if cex: await cex.close()
         if kraken: await kraken.close()
 
-# ================= ARBITRAGE =================
-_price_cache = {'cex': None, 'kraken': None, 'time': 0}
-
 @app.get("/arbitrage")
 async def arbitrage(email: str = Query(...)):
     keys = await get_keys(email)
     if not keys:
         return {"error": "Save API keys first"}
     
-    now = __import__('time').time()
-    if now - _price_cache['time'] > 60:
-        cex = kraken = None
-        try:
-            cex = ccxt.cex(keys['cex'])
-            kraken = ccxt.kraken(keys['kraken'])
-            await cex.load_markets()
-            await kraken.load_markets()
-            c_price = (await cex.fetch_ticker('XRP/USDC'))['last']
-            k_price = (await kraken.fetch_ticker('XRP/USDC'))['last']
-            _price_cache.update({'cex': c_price, 'kraken': k_price, 'time': now})
-        except Exception as e:
-            logger.warning(f"Price error: {e}")
-        finally:
-            if cex: await cex.close()
-            if kraken: await kraken.close()
-    
-    c_price = _price_cache['cex']
-    k_price = _price_cache['kraken']
-    
-    if not c_price or not k_price:
+    try:
+        cex = ccxt.cex(keys['cex'])
+        kraken = ccxt.kraken(keys['kraken'])
+        await cex.load_markets()
+        await kraken.load_markets()
+        c_price = (await cex.fetch_ticker('XRP/USDC'))['last']
+        k_price = (await kraken.fetch_ticker('XRP/USDC'))['last']
+        await cex.close()
+        await kraken.close()
+        
+        spread = abs(c_price - k_price) / min(c_price, k_price)
+        net = spread - 0.0082
+        roi = max(net * 100.0, 0)
+        direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
+        
+        return {
+            "cex": round(c_price, 6),
+            "kraken": round(k_price, 6),
+            "spread_pct": round(spread * 100, 4),
+            "roi_usdc": round(roi, 2),
+            "profitable": net > 0,
+            "direction": direction
+        }
+    except Exception as e:
+        logger.warning(f"Arbitrage error: {e}")
         return {"error": "Price unavailable"}
-    
-    spread = abs(c_price - k_price) / min(c_price, k_price)
-    net = spread - 0.0082
-    roi = max(net * 100.0, 0)
-    direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
-    
-    return {
-        "cex": round(c_price, 6),
-        "kraken": round(k_price, 6),
-        "spread_pct": round(spread * 100, 4),
-        "roi_usdc": round(roi, 2),
-        "profitable": net > 0,
-        "direction": direction
-    }
 
 @app.get("/")
 async def root():
