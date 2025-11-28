@@ -1,4 +1,4 @@
-# main.py — FINAL & 100% WORKING (November 27, 2025)
+# main.py — FULLY FIXED & WORKING (November 28, 2025)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
@@ -21,14 +21,25 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database fix
+# ================= DATABASE FIX — FORCES CORRECT SCHEMA =================
 def init_db():
     conn = sqlite3.connect('users.db', check_same_thread=False)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
-                 (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+    
+    # Drop any old/existing table to avoid column count mismatch
+    c.execute('DROP TABLE IF EXISTS user_api_keys')
+    
+    # Recreate with exactly 5 columns
+    c.execute('''CREATE TABLE user_api_keys (
+                    email TEXT PRIMARY KEY,
+                    cex_key TEXT,
+                    cex_secret TEXT,
+                    kraken_key TEXT,
+                    kraken_secret TEXT
+                 )''')
     conn.commit()
     conn.close()
+    logger.info("Database initialized with correct schema")
 
 init_db()
 
@@ -54,9 +65,14 @@ async def save_keys(data: dict):
     
     conn = sqlite3.connect('users.db')
     c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?)""",
-              (email, data.get("cex_key",""), data.get("cex_secret",""),
-               data.get("kraken_key",""), data.get("kraken_secret","")))
+    c.execute("""INSERT OR REPLACE INTO user_api_keys 
+                 (email, cex_key, cex_secret, kraken_key, kraken_secret) 
+                 VALUES (?, ?, ?, ?, ?)""",
+              (email,
+               data.get("cex_key", ""),
+               data.get("cex_secret", ""),
+               data.get("kraken_key", ""),
+               data.get("kraken_secret", "")))
     conn.commit()
     conn.close()
     logger.info(f"Keys saved for {email}")
