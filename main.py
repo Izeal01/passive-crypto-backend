@@ -1,4 +1,4 @@
-# main.py — FINAL & 100% FIXED — PERMISSIONS NOTE + MISSING ENDPOINTS
+# main.py — FINAL & 100% WORKING — USDC ONLY (November 29, 2025)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
@@ -64,7 +64,7 @@ async def get_keys_route(email: str = Query(...)):
         return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
     return {}
 
-# ================= SETTINGS (404 FIXED) =================
+# ================= SETTINGS =================
 @app.post("/set_amount")
 async def set_amount(data: dict):
     email = data.get("email")
@@ -89,11 +89,12 @@ async def set_threshold(data: dict):
     conn.commit()
     return {"status": "ok"}
 
-# ================= BALANCES — USDC ONLY =================
+# ================= BALANCES — USDC ONLY (LOGGING ADDED) =================
 @app.get("/balances")
 async def balances(email: str = Query(...)):
     keys = await get_keys(email)
     if not keys:
+        logger.info(f"No keys for {email} — returning 0 balances")
         return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
     
     cex = kraken = None
@@ -106,14 +107,14 @@ async def balances(email: str = Query(...)):
         c_bal = await cex.fetch_balance()
         k_bal = await kraken.fetch_balance()
         
-        # CEX.IO and Kraken both use 'USDC' key for USDC
+        # CEX.IO and Kraken both use 'USDC' key
         c_usdc = c_bal.get('USDC', {}).get('free') or 0.0
         k_usdc = k_bal.get('USDC', {}).get('free') or 0.0
         
-        logger.info(f"CEX.IO USDC: {c_usdc}, Kraken USDC: {k_usdc}")
+        logger.info(f"Balances for {email}: CEX.IO USDC {c_usdc}, Kraken USDC {k_usdc}")
         return {"cex_usdc": float(c_usdc), "kraken_usdc": float(k_usdc)}
     except Exception as e:
-        logger.error(f"Balance error: {e}")
+        logger.error(f"Balance error for {email}: {e}")
         return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
     finally:
         if cex: await cex.close()
@@ -144,7 +145,7 @@ async def arbitrage(email: str = Query(...)):
         roi = max(net * 100.0, 0)
         direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
         
-        logger.info(f"Arbitrage: CEX.IO {c_price}, Kraken {k_price}, Net {net*100:.4f}%")
+        logger.info(f"Arbitrage for {email}: CEX.IO {c_price}, Kraken {k_price}, Net {net*100:.4f}%")
         return {
             "cex": round(c_price, 6),
             "kraken": round(k_price, 6),
@@ -154,7 +155,7 @@ async def arbitrage(email: str = Query(...)):
             "direction": direction
         }
     except Exception as e:
-        logger.warning(f"Arbitrage error: {e}")
+        logger.warning(f"Arbitrage error for {email}: {e}")
         return {"error": "Price unavailable"}
 
 @app.get("/")
