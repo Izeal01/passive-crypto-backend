@@ -1,0 +1,46 @@
+ balances/arbitrage with safe get; correct CEX.IO symbol to XRP/USDT
+
+View Logs:
+
+2025-11-17T10:24:25.938167011Z File "/opt/render/project/src/.venv/lib/python3.13/site-packages/click/core.py", 
+line 824, in invoke 2025-11-17T10:24:25.938169091Z return callback(*args, **kwargs) 2025-11-17T10:24:25.938171191Z 
+File "/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/main.py", line 410, in main 
+2025-11-17T10:24:25.938173371Z run( 2025-11-17T10:24:25.938175531Z ~~~^ 2025-11-17T10:24:25.938177631Z app, 
+2025-11-17T10:24:25.938179831Z ^^^^ 2025-11-17T10:24:25.938181922Z ...<45 lines>... 2025-11-17T10:24:25.938184671Z 
+h11_max_incomplete_event_size=h11_max_incomplete_event_size, 2025-11-17T10:24:25.938187102Z 
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 2025-11-17T10:24:25.938189332Z ) 
+2025-11-17T10:24:25.938191482Z ^ 2025-11-17T10:24:25.938193532Z File 
+"/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/main.py", line 577, in run 
+2025-11-17T10:24:25.938195642Z server.run() 2025-11-17T10:24:25.938211562Z ~~~~~~~~~~^^ 
+2025-11-17T10:24:25.938215782Z File "/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/server.py", 
+line 65, in run 2025-11-17T10:24:25.938218462Z return asyncio.run(self.serve(sockets=sockets)) 
+2025-11-17T10:24:25.938220583Z ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 2025-11-17T10:24:25.938222832Z File 
+"/opt/render/project/python/Python-3.13.4/lib/python3.13/asyncio/runners.py", line 195, in run 
+2025-11-17T10:24:25.938224983Z return runner.run(main) 2025-11-17T10:24:25.938227273Z ~~~~~~~~~~^^^^^^ 
+2025-11-17T10:24:25.938229593Z File "/opt/render/project/python/Python-3.13.4/lib/python3.13/asyncio/runners.py", 
+line 118, in run 2025-11-17T10:24:25.938231793Z return self._loop.run_until_complete(task) 
+2025-11-17T10:24:25.938233923Z ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^ 2025-11-17T10:24:25.938236633Z File 
+"/opt/render/project/python/Python-3.13.4/lib/python3.13/asyncio/base_events.py", line 725, in run_until_complete 
+2025-11-17T10:24:25.938238773Z return future.result() 2025-11-17T10:24:25.938240863Z ~~~~~~~~~~~~~^^ 
+2025-11-17T10:24:25.938242993Z File "/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/server.py", 
+line 69, in serve 2025-11-17T10:24:25.938245113Z await self._serve(sockets) 2025-11-17T10:24:25.938259704Z File 
+"/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/server.py", line 76, in _serve 
+2025-11-17T10:24:25.938262104Z config.load() 2025-11-17T10:24:25.938264274Z ~~~~~~~~~~~^^ 
+2025-11-17T10:24:25.938276744Z File "/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/config.py", 
+line 434, in load 2025-11-17T10:24:25.938279174Z self.loaded_app = import_from_string(self.app) 
+2025-11-17T10:24:25.938281374Z ~~~~~~~~~~~~~~~~~~^^^^^^^^^^ 2025-11-17T10:24:25.938283544Z File 
+"/opt/render/project/src/.venv/lib/python3.13/site-packages/uvicorn/importer.py", line 19, in import_from_string 
+2025-11-17T10:24:25.938285674Z module = importlib.import_module(module_str) 2025-11-17T10:24:25.938287854Z File 
+"/opt/render/project/python/Python-3.13.4/lib/python3.13/importlib/__init__.py", line 88, in import_module 
+2025-11-17T10:24:25.938290004Z return _bootstrap._gcd_import(name[level:], package, level) 
+2025-11-17T10:24:25.938292094Z ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ 2025-11-17T10:24:25.938294234Z 
+File "<frozen importlib._bootstrap>", line 1387, in _gcd_import 2025-11-17T10:24:25.938296365Z File "<frozen 
+importlib._bootstrap>", line 1360, in _find_and_load 2025-11-17T10:24:25.938298534Z File "<frozen 
+importlib._bootstrap>", line 1331, in _find_and_load_unlocked 2025-11-17T10:24:25.938300694Z File "<frozen 
+importlib._bootstrap>", line 935, in _load_unlocked 2025-11-17T10:24:25.938302805Z File "<frozen 
+importlib._bootstrap_external>", line 1026, in exec_module
+2025-11-17T10:24:25.938304955Z   File "<frozen importlib._bootstrap>", line 488, in _call_with_frames_removed
+2025-11-17T10:24:25.938307075Z   File "/opt/render/project/src/main.py", line 23, in <module>
+2025-11-17T10:24:25.938309185Z     logging.basicBaseConfig(level=logging.INFO)
+2025-11-17T10:24:25.938311295Z     ^^^^^^^^^^^^^^^^^^^^^^^
+2025-11-17T10:24:25.938313575Z AttributeError: module 'logging' has no attribute 'basicBaseConfig'. Did you mean: 'basicConfig'?

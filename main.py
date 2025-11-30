@@ -1,9 +1,11 @@
-# main.py — FINAL & 100% WORKING — USDC ONLY (November 29, 2025)
-from fastapi import FastAPI, HTTPException, Query
+# main.py — FINAL & WORKING — COINBASE + KRAKEN (November 30, 2025)
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
 import sqlite3
 import logging
+import asyncio
+import os
 
 app = FastAPI()
 
@@ -22,49 +24,133 @@ logger = logging.getLogger(__name__)
 conn = sqlite3.connect('users.db', check_same_thread=False)
 c = conn.cursor()
 c.execute('''CREATE TABLE IF NOT EXISTS user_api_keys 
-             (email TEXT PRIMARY KEY, cex_key TEXT, cex_secret TEXT, kraken_key TEXT, kraken_secret TEXT)''')
+            (email TEXT PRIMARY KEY, coinbase_key TEXT, coinbase_secret TEXT, coinbase_passphrase TEXT, 
+             kraken_key TEXT, kraken_secret TEXT)''')
 c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
-             (email TEXT PRIMARY KEY, trade_amount REAL DEFAULT 100.0, auto_trade INTEGER DEFAULT 0, threshold REAL DEFAULT 0.001)''')
+            (email TEXT PRIMARY KEY, trade_amount REAL DEFAULT 100.0, auto_trade INTEGER DEFAULT 0, threshold REAL DEFAULT 0.005)''')
 conn.commit()
 
+# Global background tasks per user
+background_scanners = {}
+
 async def get_keys(email: str):
-    c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
+    c.execute("SELECT coinbase_key, coinbase_secret, coinbase_passphrase, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
     row = c.fetchone()
-    if row and row[0] and row[2]:
+    if row and row[0] and row[3]:
         return {
-            'cex': {'apiKey': row[0], 'secret': row[1] or '', 'enableRateLimit': True, 'timeout': 60000},
-            'kraken': {'apiKey': row[2], 'secret': row[3] or '', 'enableRateLimit': True, 'timeout': 60000}
+            'coinbase': {'apiKey': row[0], 'secret': row[1], 'password': row[2], 'enableRateLimit': True},
+            'kraken': {'apiKey': row[3], 'secret': row[4], 'enableRateLimit': True}
         }
     return None
 
-# ================= LOGIN =================
-@app.post("/login")
-async def login():
-    return {"status": "logged in"}
+async def arbitrage_scanner(email: str):
+    """Runs forever every 2.5 seconds per user"""
+    while True:
+        try:
+            keys = await get_keys(email)
+            if not keys:
+                await asyncio.sleep(10)
+                continue
 
-# ================= API KEYS =================
+            c.execute("SELECT auto_trade, threshold, trade_amount FROM user_settings WHERE email=?", (email,))
+            settings = c.fetchone()
+            if not settings or settings[0] == 0:
+                await asyncio.sleep(5)
+                continue
+
+            auto_trade, threshold, amount = settings
+
+            manager = ExchangeManager(
+                keys['coinbase']['apiKey'],
+                keys['coinbase']['secret'],
+                keys['coinbase']['password'],
+                keys['kraken']['apiKey'],
+                keys['kraken']['secret']
+            )
+
+            arb = await manager.calculate_arbitrage()
+            if arb and arb['net_profit_pct'] >= threshold:
+                logger.info(f"PROFIT DETECTED for {email}: {arb['net_profit_pct']}%")
+                low_ex = 'coinbase' if arb['low_exchange'] == 'Coinbase' else 'kraken'
+                high_ex = 'kraken' if arb['high_exchange'] == 'Kraken' else 'coinbase'
+
+                # Execute trades
+                await manager.place_order(low_ex, 'buy', amount)
+                await asyncio.sleep(1.5)  # Avoid rate limit
+                await manager.place_order(high_ex, 'sell', amount)
+
+            await asyncio.sleep(2.5)  # Scan every 2.5 seconds
+        except Exception as e:
+            logger.error(f"Scanner error for {email}: {e}")
+            await asyncio.sleep(5)
+
+# ================= API ENDPOINTS =================
 @app.post("/save_keys")
 async def save_keys(data: dict):
     email = data.get("email")
     if not email:
         raise HTTPException(400, "Email required")
     
-    c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?)""",
-              (email, data.get("cex_key",""), data.get("cex_secret",""),
-               data.get("kraken_key",""), data.get("kraken_secret","")))
+    c.execute("""INSERT OR REPLACE INTO user_api_keys VALUES (?, ?, ?, ?, ?, ?)""",
+              (email, data.get("coinbase_key",""), data.get("coinbase_secret",""),
+               data.get("coinbase_passphrase",""), data.get("kraken_key",""), data.get("kraken_secret","")))
     conn.commit()
-    logger.info(f"Keys saved for {email}")
+    
+    # Start scanner if not running
+    if email not in background_scanners:
+        task = asyncio.create_task(arbitrage_scanner(email))
+        background_scanners[email] = task
+        logger.info(f"Arbitrage scanner started for {email}")
+
     return {"status": "saved"}
 
-@app.get("/get_keys")
-async def get_keys_route(email: str = Query(...)):
-    c.execute("SELECT cex_key, cex_secret, kraken_key, kraken_secret FROM user_api_keys WHERE email=?", (email,))
-    row = c.fetchone()
-    if row:
-        return {"cex_key": row[0] or "", "cex_secret": row[1] or "", "kraken_key": row[2] or "", "kraken_secret": row[3] or ""}
-    return {}
+@app.get("/balances")
+async def balances(email: str = Query(...)):
+    keys = await get_keys(email)
+    if not keys:
+        return {"coinbase_usdc": 0.0, "kraken_usdc": 0.0}
+    
+    try:
+        coinbase = ccxt.coinbaseadvanced(keys['coinbase'])
+        kraken = ccxt.kraken(keys['kraken'])
+        await coinbase.load_markets()
+        await kraken.load_markets()
 
-# ================= SETTINGS =================
+        cb_bal = await coinbase.fetch_balance()
+        k_bal = await kraken.fetch_balance()
+
+        cb_usdc = cb_bal.get('total', {}).get('USDC', 0.0) or cb_bal.get('USDC', {}).get('free', 0.0)
+        k_usdc = k_bal.get('USDC', {}).get('free', 0.0)
+
+        return {"coinbase_usdc": float(cb_usdc), "kraken_usdc": float(k_usdc)}
+    except Exception as e:
+        logger.error(f"Balance error: {e}")
+        return {"coinbase_usdc": 0.0, "kraken_usdc": 0.0}
+    finally:
+        if 'coinbase' in locals(): await coinbase.close()
+        if 'kraken' in locals(): await kraken.close()
+
+@app.get("/arbitrage")
+async def arbitrage(email: str = Query(...)):
+    keys = await get_keys(email)
+    if not keys:
+        return {"error": "Save API keys first"}
+
+    try:
+        manager = ExchangeManager(
+            keys['coinbase']['apiKey'], keys['coinbase']['secret'], keys['coinbase']['password'],
+            keys['kraken']['apiKey'], keys['kraken']['secret']
+        )
+        arb = await manager.calculate_arbitrage()
+        if arb:
+            return arb
+        return {
+            "coinbase": "—", "kraken": "—", "spread_pct": 0,
+            "roi_usdc": 0, "profitable": False, "direction": "No opportunity"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
 @app.post("/set_amount")
 async def set_amount(data: dict):
     email = data.get("email")
@@ -84,82 +170,14 @@ async def toggle_auto_trade(data: dict):
 @app.post("/set_threshold")
 async def set_threshold(data: dict):
     email = data.get("email")
-    threshold = float(data.get("threshold", 0.001))
+    threshold = float(data.get("threshold", 0.005))
     c.execute("INSERT OR REPLACE INTO user_settings (email, threshold) VALUES (?, ?)", (email, threshold))
     conn.commit()
     return {"status": "ok"}
 
-# ================= BALANCES — USDC ONLY =================
-@app.get("/balances")
-async def balances(email: str = Query(...)):
-    keys = await get_keys(email)
-    if not keys:
-        return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
-    
-    cex = kraken = None
-    try:
-        cex = ccxt.cex(keys['cex'])
-        kraken = ccxt.kraken(keys['kraken'])
-        await cex.load_markets()
-        await kraken.load_markets()
-        
-        c_bal = await cex.fetch_balance()
-        k_bal = await kraken.fetch_balance()
-        
-        # CEX.IO and Kraken both use 'USDC' key for USDC
-        c_usdc = c_bal.get('USDC', {}).get('free') or 0.0
-        k_usdc = k_bal.get('USDC', {}).get('free') or 0.0
-        
-        logger.info(f"CEX.IO USDC: {c_usdc}, Kraken USDC: {k_usdc}")
-        return {"cex_usdc": float(c_usdc), "kraken_usdc": float(k_usdc)}
-    except Exception as e:
-        logger.error(f"Balance error: {e}")
-        return {"cex_usdc": 0.0, "kraken_usdc": 0.0}
-    finally:
-        if cex: await cex.close()
-        if kraken: await kraken.close()
-
-# ================= ARBITRAGE — USDC-XRP-USDC =================
-@app.get("/arbitrage")
-async def arbitrage(email: str = Query(...)):
-    keys = await get_keys(email)
-    if not keys:
-        return {"error": "Save API keys first"}
-    
-    cex = kraken = None
-    try:
-        cex = ccxt.cex(keys['cex'])
-        kraken = ccxt.kraken(keys['kraken'])
-        await cex.load_markets()
-        await kraken.load_markets()
-        
-        c_price = (await cex.fetch_ticker('XRP/USDC'))['last']
-        k_price = (await kraken.fetch_ticker('XRP/USDC'))['last']
-        
-        await cex.close()
-        await kraken.close()
-        
-        spread = abs(c_price - k_price) / min(c_price, k_price)
-        net = spread - 0.0082
-        roi = max(net * 100.0, 0)
-        direction = "Buy CEX.IO → Sell Kraken" if c_price < k_price else "Buy Kraken → Sell CEX.IO"
-        
-        logger.info(f"Arbitrage: CEX.IO {c_price}, Kraken {k_price}, Net {net*100:.4f}%")
-        return {
-            "cex": round(c_price, 6),
-            "kraken": round(k_price, 6),
-            "spread_pct": round(spread * 100, 4),
-            "roi_usdc": round(roi, 2),
-            "profitable": net > 0,
-            "direction": direction
-        }
-    except Exception as e:
-        logger.warning(f"Arbitrage error: {e}")
-        return {"error": "Price unavailable"}
-
 @app.get("/")
 async def root():
-    return {"message": "Passive Crypto Income Backend – USDC Only"}
+    return {"message": "Passive Crypto Income – Coinbase + Kraken USDC Arbitrage"}
 
 if __name__ == "__main__":
     import uvicorn
