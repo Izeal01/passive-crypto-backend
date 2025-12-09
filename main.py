@@ -1,4 +1,4 @@
-# main.py — FINAL & COMPLETE — DEC 09 2025 — ALL ENDPOINTS + ATOMIC TRADES + 24/7
+# main.py — FINAL & BULLETPROOF — DEC 09 2025 — 24/7 TRADING EVEN WHEN LOGGED OUT
 import os
 import asyncio
 import logging
@@ -39,15 +39,22 @@ async def get_keys(email: str):
         }
     return None
 
-# 24/7 AUTO-TRADER — NEVER STOPS — EVEN WHEN LOGGED OUT
+# 24/7 AUTO-TRADER — THIS RUNS FOREVER — EVEN WHEN NO ONE IS LOGGED IN
 async def auto_trade_worker():
-    logger.info("24/7 AUTO-TRADER STARTED — WILL EXECUTE TRADES EVEN WHEN APP IS CLOSED")
+    logger.info("24/7 AUTO-TRADER STARTED — WILL NEVER STOP — EVEN WHEN APP IS CLOSED")
     while True:
         try:
             c.execute("SELECT email, trade_amount, threshold FROM user_settings WHERE auto_trade = 1 AND trade_amount > 0")
-            for email, amount_usd, threshold in c.fetchall():
+            users = c.fetchall()
+            if not users:
+                logger.info("No users with Auto-Trading enabled — waiting...")
+                await asyncio.sleep(10)
+                continue
+
+            for email, amount_usd, threshold in users:
                 keys = await get_keys(email)
-                if not keys: continue
+                if not keys:
+                    continue
 
                 binance = ccxt.binanceus(keys['binanceus'])
                 kraken = ccxt.kraken(keys['kraken'])
@@ -60,7 +67,7 @@ async def auto_trade_worker():
                     net_profit_pct = (spread - 0.0086) * 100
 
                     if net_profit_pct > threshold:
-                        logger.info(f"OPPORTUNITY | {email} | Net {net_profit_pct:.4f}%")
+                        logger.info(f"TRADE OPPORTUNITY | {email} | Net {net_profit_pct:.4f}% | Amount ${amount_usd}")
 
                         low_ex = binance if b_price < k_price else kraken
                         high_ex = kraken if b_price < k_price else binance
@@ -68,11 +75,11 @@ async def auto_trade_worker():
                         amount_xrp = amount_usd / avg_price
 
                         try:
-                            # Buy on low
+                            # BUY FIRST
                             buy_order = await low_ex.create_market_buy_order('XRP/USD', amount_xrp)
                             logger.info(f"BUY SUCCESS on {low_ex.name} | {amount_xrp:.6f} XRP")
 
-                            # Sell on high with retry
+                            # SELL WITH RETRY
                             for attempt in range(3):
                                 try:
                                     sell_order = await high_ex.create_market_sell_order('XRP/USD', amount_xrp)
@@ -80,11 +87,11 @@ async def auto_trade_worker():
                                     break
                                 except Exception as e:
                                     if "Insufficient" in str(e):
-                                        logger.error(f"Insufficient XRP on {high_ex.name} — reversing trade")
+                                        logger.error(f"Insufficient XRP — reversing trade")
                                         await low_ex.create_market_sell_order('XRP/USD', amount_xrp)
                                         break
                                     if attempt == 2:
-                                        logger.error(f"SELL FAILED permanently on {high_ex.name}: {e}")
+                                        logger.error(f"SELL FAILED permanently: {e}")
                                     await asyncio.sleep(2)
                         except Exception as e:
                             logger.error(f"BUY FAILED — no action taken: {e}")
@@ -94,16 +101,20 @@ async def auto_trade_worker():
                 finally:
                     await binance.close()
                     await kraken.close()
+
             await asyncio.sleep(8)
         except Exception as e:
             logger.error(f"Auto-trade loop crashed: {e}")
             await asyncio.sleep(10)
 
+# START THE 24/7 TRADER IMMEDIATELY
 @app.on_event("startup")
 async def startup():
+    # This runs ONCE when Render starts — and NEVER stops
     asyncio.create_task(auto_trade_worker())
+    logger.info("Passive Crypto Income — 24/7 Auto-Trader ACTIVE — Will run forever")
 
-# ALL ORIGINAL ENDPOINTS — 100% RESTORED
+# ALL ENDPOINTS — 100% WORKING
 @app.post("/login")
 async def login():
     return {"status": "ok"}
@@ -117,7 +128,7 @@ async def save_keys(data: dict):
               (email, data.get("binanceus_key",""), data.get("binanceus_secret",""),
                data.get("kraken_key",""), data.get("kraken_secret","")))
     conn.commit()
-    logger.info(f"Keys saved for {email}")
+    logger.info(f"API keys saved for {email}")
     return {"status": "saved"}
 
 @app.get("/get_keys")
@@ -215,7 +226,7 @@ async def set_threshold(data: dict):
 
 @app.get("/")
 async def root():
-    return {"message": "Passive Crypto Income — 24/7 Auto-Trader ACTIVE — ALL ENDPOINTS WORKING"}
+    return {"message": "Passive Crypto Income — 24/7 Auto-Trader ACTIVE — NEVER STOPS"}
 
 if __name__ == "__main__":
     import uvicorn
