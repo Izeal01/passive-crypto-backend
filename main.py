@@ -1,4 +1,4 @@
-# main.py — FINAL & PERFECT — Passive Crypto Income (USD-XRP-USD 24/7 Auto-Trading)
+# main.py — FINAL & 100% FIXED — Passive Crypto Income (USD-XRP-USD 24/7 Auto-Trading)
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 import ccxt.async_support as ccxt
@@ -63,7 +63,7 @@ async def get_user_settings(email: str):
         }
     return {"amount": 0.0, "auto_trade": False, "threshold": 0.0}
 
-# 24/7 Auto-Trading Worker
+# 24/7 Auto-Trading Worker (unchanged)
 async def auto_trading_worker(email: str):
     while True:
         try:
@@ -196,7 +196,7 @@ async def arbitrage(email: str = Query(...)):
     except Exception as e:
         return {"error": "Price unavailable"}
 
-# FIXED: Each setting updates ONLY its own column
+# CRITICAL FIX: Each setting updates only its own column
 @app.post("/set_amount")
 async def set_amount(data: dict):
     email = data.get("email")
@@ -213,8 +213,7 @@ async def set_amount(data: dict):
 async def set_threshold(data: dict):
     email = data.get("email")
     try:
-        threshold = float(data["threshold"])
-        if threshold < 0: threshold = 0.0
+        threshold = float(data["threshold"])  # ← NOW ALLOWS NEGATIVE VALUES
     except:
         threshold = 0.0
     c.execute("INSERT INTO user_settings (email, threshold) VALUES (?, ?) ON CONFLICT(email) DO UPDATE SET threshold=excluded.threshold", (email, threshold))
